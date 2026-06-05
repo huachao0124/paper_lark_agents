@@ -32,6 +32,27 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(route.text, "critique this paper")
         self.assertFalse(route.broadcast)
 
+    def test_bot_display_name_suffix_is_addressed(self):
+        # Feishu renders an @ of a "Codex-Mac" bot as "@Codex-Mac"; it must be
+        # recognized as addressing codex, not treated as an unaddressed broadcast.
+        route = route_message("@Codex-Mac use deepseek")
+        self.assertEqual(route.agent, "codex")
+        self.assertEqual(route.text, "use deepseek")
+        self.assertFalse(route.broadcast)
+        route = route_message("@Claude-Mac thoughts?")
+        self.assertEqual(route.agent, "claude")
+        self.assertFalse(route.broadcast)
+
+    def test_hyphenated_word_is_not_addressing(self):
+        # A bare hyphenated word that merely contains an agent name stays a
+        # broadcast (no false positive without an explicit "@").
+        route = route_message(
+            "codex-cli is a great tool",
+            respond_to_all=True,
+            default_agent="codex",
+        )
+        self.assertTrue(route.broadcast)
+
     def test_responder_command_routes(self):
         for text in ("/responder claude", "!responder claude", "responder: claude"):
             route = route_message(text)

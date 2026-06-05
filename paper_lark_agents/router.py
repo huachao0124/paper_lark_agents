@@ -247,7 +247,12 @@ def split_multi_agent_directives(content: str) -> dict[AgentName, str] | None:
 
 
 def _iter_agent_mentions(text: str):
-    pattern = re.compile(r"@?claude\s+code|@?claude|@?codex", re.IGNORECASE)
+    # An explicit "@name" may carry a bot display-name suffix ("@Codex-Mac");
+    # bare names keep their old, suffix-free matching to avoid false positives.
+    pattern = re.compile(
+        r"@(?:claude\s+code|claude|codex)(?:-[A-Za-z0-9]+)?|claude\s+code|claude|codex",
+        re.IGNORECASE,
+    )
     for match in pattern.finditer(text):
         start, end = match.span()
         if start > 0 and not _is_left_mention_boundary(text[start - 1]):
@@ -323,11 +328,23 @@ def is_raw_session_command(text: str) -> bool:
 def _strip_prefix(text: str, lowered: str, prefix: str) -> str | None:
     if not lowered.startswith(prefix):
         return None
-    if not prefix.endswith(":") and len(lowered) > len(prefix):
-        next_char = lowered[len(prefix)]
-        if not _is_prefix_boundary(next_char):
+    consumed = len(prefix)
+    if not prefix.endswith(":") and len(lowered) > consumed:
+        next_char = lowered[consumed]
+        # Allow a bot display-name suffix on an explicitly-marked mention: Feishu
+        # renders an @ of the "Codex-Mac" bot as "@Codex-Mac", so accept
+        # "@codex-mac" / "/claude-mac" as addressing codex/claude. Bare names
+        # ("codex-cli is great") are left alone to avoid false positives.
+        if next_char == "-" and prefix[:1] in {"@", "/", "!"}:
+            suffix = re.match(r"-[A-Za-z0-9]+", lowered[consumed:])
+            after = consumed + suffix.end() if suffix else consumed
+            if suffix and (after >= len(lowered) or _is_prefix_boundary(lowered[after])):
+                consumed = after
+            else:
+                return None
+        elif not _is_prefix_boundary(next_char):
             return None
-    remainder = text[len(prefix) :].lstrip()
+    remainder = text[consumed:].lstrip()
     if remainder[:1] in {":", "：", ",", "，", "、", ";", "；"}:
         remainder = remainder[1:].strip()
     return remainder

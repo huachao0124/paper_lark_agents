@@ -41,6 +41,26 @@ class MemoryTests(unittest.TestCase):
             self.assertIn("paper B", context_b)
             self.assertNotIn("answer A", context_b)
 
+    def test_context_excludes_given_agents_own_turns(self):
+        # A handoff recap for an agent should omit that agent's own turns
+        # (already in its CLI session) but keep the peer's and the human's.
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = ChatMemory(Path(tmp), max_turns=10, max_chars=2000)
+            event = MessageEvent(
+                event_id="e", chat_id="oc_x", chat_type="group",
+                content="human q", sender_id="ou_user", message_id="om_x",
+            )
+            memory.append_user(event, "human q")
+            memory.append_assistant("oc_x", "codex", "codex says A")
+            memory.append_assistant("oc_x", "claude", "claude says B")
+
+            recap = memory.context("oc_x", exclude_agent="codex")
+            self.assertNotIn("codex says A", recap)
+            self.assertIn("claude says B", recap)
+            self.assertIn("human q", recap)
+            # Without exclusion everything is present.
+            self.assertIn("codex says A", memory.context("oc_x"))
+
 
 class OutboxTests(unittest.TestCase):
     def test_outbox_recognizes_recent_assistant_message(self):

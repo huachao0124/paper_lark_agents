@@ -78,7 +78,7 @@ class ChatMemory:
             ),
         )
 
-    def context(self, chat_id: str) -> str:
+    def context(self, chat_id: str, exclude_agent: str | None = None) -> str:
         entries = self._read(chat_id)[-self.max_turns :]
         if not entries:
             return "No previous discussion in this Feishu group yet."
@@ -90,6 +90,11 @@ class ChatMemory:
             if not content:
                 continue
             if role == "assistant":
+                # Skip the receiving agent's own turns: they already exist in
+                # its CLI session, so re-sending them in a handoff recap is
+                # redundant. Peer + human turns are its actual blind spot.
+                if exclude_agent and entry.get("agent") == exclude_agent:
+                    continue
                 name = str(entry.get("agent") or "assistant")
             else:
                 name = str(entry.get("sender_id") or "user")

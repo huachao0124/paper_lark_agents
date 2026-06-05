@@ -1955,16 +1955,35 @@ class PaperAgentBridge:
                 key_sent.add(sig)
                 agent = key.split(":", 1)[0]
                 LOGGER.info("follow-up reply from %s in %s", agent, event.chat_id)
-                self.send_bridge_markdown(
-                    event.chat_id, text, agent=agent, discussion_trigger=False,
-                )
-                if self.settings.enable_memory:
-                    self.memory.append_assistant(event.chat_id, agent, text)
-                if self.should_enqueue_teammate_handoff(route, text, depth):
-                    self.enqueue_teammate_handoff(
-                        event, source_agent=agent, reply=text,
-                        inbound_source_agent=source_agent, handoff_depth=depth,
+                # Deliver each follow-up stage as its own card (same as the first
+                # stage) instead of a bare text message, so a multi-stage turn
+                # reads as several cards rather than "one card + loose messages".
+                # finalize_turn_reply carries the same outbox/memory/handoff
+                # bookkeeping send_bridge_markdown would have done.
+                card = None
+                if self.settings.send_progress:
+                    card = self.start_turn_card(
+                        event.chat_id, agent,
+                        self.chat_model_label(event.chat_id, agent),
+                        self.chat_effort_label(event.chat_id, agent),
+                        force=True,
                     )
+                if card:
+                    self.finalize_turn_reply(
+                        card, route, event, text,
+                        source_agent=source_agent, handoff_depth=depth,
+                    )
+                else:
+                    self.send_bridge_markdown(
+                        event.chat_id, text, agent=agent, discussion_trigger=False,
+                    )
+                    if self.settings.enable_memory:
+                        self.memory.append_assistant(event.chat_id, agent, text)
+                    if self.should_enqueue_teammate_handoff(route, text, depth):
+                        self.enqueue_teammate_handoff(
+                            event, source_agent=agent, reply=text,
+                            inbound_source_agent=source_agent, handoff_depth=depth,
+                        )
             # Checkpoint advanced offsets so a restart resumes from the right
             # place and re-scans anything written while the bridge was down.
             if dirty:

@@ -800,6 +800,7 @@ class PaperAgentBridge:
                     route.agent,
                     self.chat_model_label(event.chat_id, route.agent),
                     self.chat_effort_label(event.chat_id, route.agent),
+                    force=source_agent is None,  # human message takes priority
                 )
             prompt, session_context = self.build_agent_prompt(
                 route.agent,
@@ -1024,6 +1025,7 @@ class PaperAgentBridge:
             chat_id, agent,
             self.chat_model_label(chat_id, agent),
             self.chat_effort_label(chat_id, agent),
+            force=True,  # session command is human-initiated
         )
         run_id = uuid.uuid4().hex
         start_marker, end_marker = runtime.reply_markers(run_id)
@@ -1727,12 +1729,18 @@ class PaperAgentBridge:
             summary = summary[:497].rstrip() + "..."
         status.update(state, summary)
 
-    def start_turn_card(self, chat_id: str, agent: str, model: str, effort: str) -> TurnCard | None:
-        # Only one card per (agent, chat) at a time within the current process.
-        # If dispatch is already running a turn for this agent+chat, skip.
+    def start_turn_card(
+        self, chat_id: str, agent: str, model: str, effort: str, *, force: bool = False,
+    ) -> TurnCard | None:
+        # One card per (agent, chat). If there's already one running:
+        # - force=True (human message): collapse the old card, create new one
+        # - force=False (handoff): skip, let it queue without a card
         card_key = f"{agent}:{chat_id}"
         if card_key in self._active_turn_cards:
-            return None
+            if not force:
+                return None
+            old = self._active_turn_cards.pop(card_key)
+            self._render_turn_card(old, "pending", "新消息到达,排队中…")
         agent_name = self.agent_display_name(agent)
         started_at = time.time()
         card = turn_reply_card(agent_name, "running", "✻ 思考中", model=model, effort=effort, started_at=started_at)

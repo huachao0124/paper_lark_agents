@@ -356,7 +356,7 @@ class PaperAgentBridge:
                     if card:
                         self._render_turn_card(card, "failed", "超时未完成，请重试。")
                         with self._turn_card_lock:
-            self._active_turn_cards.pop(f"{card.agent}:{card.chat_id}", None)
+                            self._active_turn_cards.pop(f"{card.agent}:{card.chat_id}", None)
                     self.pending_runs.mark_done(run.run_id, status="timeout")
                     LOGGER.info("pending run %s timed out after %.0fs (agent idle)", run.run_id, age)
                     return
@@ -1984,7 +1984,7 @@ class PaperAgentBridge:
         if self.is_no_reply(text):
             self._render_turn_card(card, "skipped", "—")
             with self._turn_card_lock:
-            self._active_turn_cards.pop(f"{card.agent}:{card.chat_id}", None)
+                self._active_turn_cards.pop(f"{card.agent}:{card.chat_id}", None)
             return
         limit = self.settings.max_message_chars
         head = text if len(text) <= limit else text[:limit].rstrip() + "\n\n…（下接）"

@@ -506,9 +506,24 @@ class PaperAgentBridge:
             self.handle_chat_closed_event(event)
             return
         if event.event_type in {"", MESSAGE_EVENT_TYPE}:
-            self.handle_event(MessageEvent.from_json(event.raw))
+            # Run in a thread so long-running dispatch doesn't block event
+            # consumption — new human messages arrive even while an agent turn
+            # is in progress.
+            msg_event = MessageEvent.from_json(event.raw)
+            threading.Thread(
+                target=self._handle_event_safe,
+                args=(msg_event,),
+                daemon=True,
+                name=f"event-{msg_event.message_id[:12]}",
+            ).start()
             return
         LOGGER.debug("ignoring unsupported event type %s", event.event_type)
+
+    def _handle_event_safe(self, event: MessageEvent) -> None:
+        try:
+            self.handle_event(event)
+        except Exception:
+            LOGGER.exception("unhandled error processing event %s", event.event_id)
 
     def handle_bot_added_event(self, event: LarkEvent) -> None:
         chat_id = event.chat_id

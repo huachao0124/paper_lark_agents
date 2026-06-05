@@ -1745,6 +1745,10 @@ class PaperAgentBridge:
             with self._followup_lock:
                 snapshot = dict(self._followup_cursors)
             for key, (path, cur, event, route, source_agent, depth) in snapshot.items():
+                # Skip if dispatch is actively running — let dispatch own
+                # transcript reading to avoid both paths sending the same reply.
+                if self._active_run_ids:
+                    continue
                 try:
                     text, new_cur = self.agents.claude_session.poll_followup_reply(path, cur, timeout=0)
                 except Exception:

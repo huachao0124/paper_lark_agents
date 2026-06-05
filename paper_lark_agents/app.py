@@ -325,9 +325,15 @@ class PaperAgentBridge:
         event = self.pending_run_event(run)
         route = Route("agent", text=run.route_text, agent=run.agent)
         try:
+            # If the run had no card (was queued while another card was active),
+            # create one now — the previous card should be finished by now.
+            if not card and self.settings.send_progress:
+                card = self.start_turn_card(
+                    run.chat_id, run.agent,
+                    run.model_label or self.chat_model_label(run.chat_id, run.agent),
+                    run.effort_label or self.chat_effort_label(run.chat_id, run.agent),
+                )
             if card:
-                # Card turn: morph the existing progress card into the reply
-                # (finalize handles [NO_REPLY], artifacts, handoff, outbox, memory).
                 self.finalize_turn_reply(
                     card,
                     route,

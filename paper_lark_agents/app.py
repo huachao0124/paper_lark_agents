@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+import json
 import logging
 from pathlib import Path
 import re
@@ -233,6 +234,7 @@ class PaperAgentBridge:
 
     def serve(self) -> None:
         self._load_chat_names()
+        self._load_followup_cursors()
         stop_workers = threading.Event()
         handoff_worker = self.start_handoff_worker(stop_workers)
         pending_worker = self.start_pending_run_worker(stop_workers)
@@ -1807,6 +1809,77 @@ class PaperAgentBridge:
             self._followup_cursors[key] = (
                 transcript_path, transcript_offset, event, route, source_agent, handoff_depth,
             )
+        # Persist so a bridge restart keeps watching for the teammate/subagent
+        # reply, which is produced in tmux and survives the restart on its own.
+        self._persist_followup_cursors()
+
+    def _followup_state_path(self) -> Path:
+        return self.settings.state_dir / "followup_cursors.json"
+
+    def _persist_followup_cursors(self) -> None:
+        with self._followup_lock:
+            snapshot = dict(self._followup_cursors)
+        data = {}
+        for key, (path, offset, event, route, source_agent, depth) in snapshot.items():
+            data[key] = {
+                "transcript_path": path,
+                "offset": offset,
+                "event": {
+                    "event_id": event.event_id, "chat_id": event.chat_id,
+                    "chat_type": event.chat_type, "content": event.content,
+                    "sender_id": event.sender_id, "message_id": event.message_id,
+                    "message_type": event.message_type, "create_time": event.create_time,
+                },
+                "route": {
+                    "kind": route.kind, "text": route.text,
+                    "agent": route.agent, "broadcast": route.broadcast,
+                },
+                "source_agent": source_agent, "handoff_depth": depth,
+            }
+        try:
+            path = self._followup_state_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
+        except OSError:
+            LOGGER.warning("failed to persist followup cursors", exc_info=True)
+
+    def _load_followup_cursors(self) -> None:
+        path = self._followup_state_path()
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(data, dict):
+            return
+        restored: dict[str, tuple] = {}
+        for key, entry in data.items():
+            try:
+                ev, rt = entry["event"], entry["route"]
+                event = MessageEvent(
+                    event_id=ev.get("event_id", ""), chat_id=ev.get("chat_id", ""),
+                    chat_type=ev.get("chat_type", "group"), content=ev.get("content", ""),
+                    sender_id=ev.get("sender_id", ""), message_id=ev.get("message_id", ""),
+                    message_type=ev.get("message_type", ""), create_time=ev.get("create_time", ""),
+                )
+                route = Route(
+                    kind=rt.get("kind", "agent"), text=rt.get("text", ""),
+                    agent=rt.get("agent"), broadcast=bool(rt.get("broadcast", False)),
+                )
+                restored[key] = (
+                    entry["transcript_path"], int(entry["offset"]), event, route,
+                    entry.get("source_agent"), int(entry.get("handoff_depth", 0)),
+                )
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+        if restored:
+            with self._followup_lock:
+                for key, value in restored.items():
+                    self._followup_cursors.setdefault(key, value)
+            LOGGER.info("restored %d followup cursor(s) from disk", len(restored))
 
     def start_followup_worker(self, stop_event: threading.Event) -> threading.Thread | None:
         if self.default_agent != "claude":
@@ -1828,6 +1901,7 @@ class PaperAgentBridge:
             stop_event.wait(3)
             with self._followup_lock:
                 snapshot = dict(self._followup_cursors)
+            dirty = False
             for key, (path, cur, event, route, source_agent, depth) in snapshot.items():
                 # Skip if dispatch is actively running — let dispatch own
                 # transcript reading to avoid both paths sending the same reply.
@@ -1838,6 +1912,8 @@ class PaperAgentBridge:
                 except Exception:
                     continue
                 # Update cursor even if no result (advances past consumed lines).
+                if new_cur != cur:
+                    dirty = True
                 with self._followup_lock:
                     if key in self._followup_cursors:
                         old = self._followup_cursors[key]
@@ -1866,6 +1942,10 @@ class PaperAgentBridge:
                         event, source_agent=agent, reply=text,
                         inbound_source_agent=source_agent, handoff_depth=depth,
                     )
+            # Checkpoint advanced offsets so a restart resumes from the right
+            # place and re-scans anything written while the bridge was down.
+            if dirty:
+                self._persist_followup_cursors()
 
     def update_turn_card(self, card: TurnCard | None, detail: str) -> None:
         if card:

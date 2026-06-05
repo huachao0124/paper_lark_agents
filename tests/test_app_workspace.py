@@ -7,6 +7,7 @@ from unittest.mock import patch
 from paper_lark_agents.app import PaperAgentBridge
 from paper_lark_agents.config import load_settings
 from paper_lark_agents.lark_cli import LarkEvent, MessageEvent
+from paper_lark_agents.router import Route
 
 
 class FakeAgents:
@@ -326,6 +327,52 @@ def card_text(value):
     if isinstance(value, list):
         return "\n".join(card_text(item) for item in value)
     return ""
+
+
+class FollowupCursorPersistenceTests(unittest.TestCase):
+    def settings(self, root: Path):
+        with patch.dict(
+            os.environ,
+            {
+                "PLA_WORKSPACE": str(root),
+                "PLA_WORKSPACE_ROOTS": str(root),
+                "PLA_STATE_DIR": str(root / ".state"),
+                "PLA_AGENT_MODE": "claude",
+            },
+            clear=True,
+        ):
+            return load_settings(None)
+
+    def _event(self, chat_id="oc_x"):
+        return MessageEvent(
+            event_id="evt", chat_id=chat_id, chat_type="group",
+            content="hi", sender_id="ou_1", message_id="om_1", message_type="text",
+        )
+
+    def test_followup_cursor_survives_restart(self):
+        # A teammate/subagent reply is produced in tmux and survives a bridge
+        # restart; the cursor watching for it must survive too, or the reply is
+        # silently dropped.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bridge = PaperAgentBridge(self.settings(root))
+            route = Route("agent", text="ask", agent="claude")
+            bridge.register_followup_cursor(
+                "claude", self._event(), route, "/x/t.jsonl", 1234, None, 0,
+            )
+            self.assertTrue(bridge._followup_state_path().exists())
+
+            # Fresh bridge = simulated restart: in-memory cursors start empty,
+            # then are restored from disk.
+            restarted = PaperAgentBridge(self.settings(root))
+            self.assertEqual(restarted._followup_cursors, {})
+            restarted._load_followup_cursors()
+            self.assertIn("claude:oc_x", restarted._followup_cursors)
+            path, offset, ev, rt, src, depth = restarted._followup_cursors["claude:oc_x"]
+            self.assertEqual((path, offset), ("/x/t.jsonl", 1234))
+            self.assertEqual(ev.chat_id, "oc_x")
+            self.assertEqual((rt.kind, rt.agent), ("agent", "claude"))
+            self.assertEqual((src, depth), (None, 0))
 
 
 if __name__ == "__main__":

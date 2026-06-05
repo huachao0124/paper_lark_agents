@@ -1793,17 +1793,7 @@ class PaperAgentBridge:
         handoff_depth: int,
     ) -> None:
         if self.is_no_reply(text):
-            # Collapse to a near-invisible single-character card. We can't
-            # delete Feishu messages, but a tiny "·" with no header label is
-            # the least disruptive option.
-            try:
-                minimal = {
-                    "config": {"wide_screen_mode": True, "update_multi": True},
-                    "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": "·"}}],
-                }
-                self.lark.update_card(card.message_id, minimal)
-            except LarkCLIError:
-                pass
+            self._render_turn_card(card, "skipped", "—")
             self._active_turn_cards.pop(f"{card.agent}:{card.chat_id}", None)
             return
         limit = self.settings.max_message_chars

@@ -1780,11 +1780,14 @@ class PaperAgentBridge:
         # is under a lock so concurrent event threads don't race.
         card_key = f"{agent}:{chat_id}"
         with self._turn_card_lock:
-            if card_key in self._active_turn_cards:
+            old = self._active_turn_cards.get(card_key)
+            if old:
                 if not force:
                     return None
-                old = self._active_turn_cards.pop(card_key)
-                self._render_turn_card(old, "pending", "新消息到达,排队中…")
+                # Only overwrite if the old card is still running (not yet
+                # finalized). If finalize already rendered it as done/skipped,
+                # just remove the stale entry and create a fresh card.
+                self._active_turn_cards.pop(card_key, None)
             agent_name = self.agent_display_name(agent)
             started_at = time.time()
             card = turn_reply_card(agent_name, "running", "✻ 思考中", model=model, effort=effort, started_at=started_at)

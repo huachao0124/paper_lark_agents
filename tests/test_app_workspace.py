@@ -121,7 +121,7 @@ class AppWorkspaceTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(len(fake_lark.cards), 1)
-            self.assertEqual(fake_lark.pins, ["card_1"])
+            self.assertEqual(fake_lark.pins, [])  # pin disabled
             self.assertGreaterEqual(len(fake_lark.updates), 1)
             final_card = fake_lark.updates[-1][1]
             self.assertEqual(final_card["header"]["title"]["content"], "AI Status")
@@ -221,7 +221,7 @@ class AppWorkspaceTests(unittest.TestCase):
                 ],
             )
             self.assertEqual(len(fake_lark.cards), 1)
-            self.assertEqual(fake_lark.pins, ["card_1"])
+            self.assertEqual(fake_lark.pins, [])  # pin disabled
             self.assertGreaterEqual(len(fake_lark.updates), 1)
             self.assertEqual(len(fake_lark.markdowns), 0)
             final_card = fake_lark.updates[-1][1]

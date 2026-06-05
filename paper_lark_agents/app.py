@@ -334,6 +334,18 @@ class PaperAgentBridge:
             LOGGER.warning("pending run %s recovery failed: %s", run.run_id, exc)
             return
         if reply is None:
+            # If the run has been pending for more than 2x its timeout,
+            # the agent likely crashed or was interrupted — mark it failed
+            # so the card doesn't stay "Running" forever.
+            age = time.time() - run.created_at if run.created_at else 0
+            max_age = (run.timeout or self.agent_timeout(run.agent)) * 2
+            if age > max_age:
+                if card:
+                    self._render_turn_card(card, "failed", "超时未完成，请重试。")
+                    self._active_turn_cards.pop(f"{card.agent}:{card.chat_id}", None)
+                self.pending_runs.mark_done(run.run_id, status="timeout")
+                LOGGER.info("pending run %s timed out after %.0fs", run.run_id, age)
+                return
             self.update_recovered_status(run, card)
             return
         if not self.pending_runs.claim(run.run_id):

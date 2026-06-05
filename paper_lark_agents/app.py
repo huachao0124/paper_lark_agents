@@ -231,6 +231,7 @@ class PaperAgentBridge:
         self._followup_lock = threading.Lock()
 
     def serve(self) -> None:
+        self._load_chat_names()
         stop_workers = threading.Event()
         handoff_worker = self.start_handoff_worker(stop_workers)
         pending_worker = self.start_pending_run_worker(stop_workers)
@@ -245,6 +246,20 @@ class PaperAgentBridge:
                 pending_worker.join(timeout=2)
             if followup_worker:
                 followup_worker.join(timeout=2)
+
+    def _load_chat_names(self) -> None:
+        """Query Feishu for group names and register them with the session runtimes."""
+        try:
+            chats = self.lark.list_chats()
+        except LarkCLIError:
+            LOGGER.warning("failed to load chat names from Feishu")
+            return
+        for chat in chats:
+            chat_id = chat.get("chat_id") or ""
+            name = chat.get("name") or ""
+            if chat_id and name:
+                self.agents.codex_session.set_chat_label(chat_id, name)
+                self.agents.claude_session.set_chat_label(chat_id, name)
 
     def start_handoff_worker(self, stop_event: threading.Event) -> threading.Thread | None:
         if not self.settings.enable_agent_discussion or not self.settings.direct_agent_handoff:

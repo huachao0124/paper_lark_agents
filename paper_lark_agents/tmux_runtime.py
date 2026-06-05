@@ -62,6 +62,7 @@ class TmuxSessionRuntime:
     def __init__(self, settings: Settings, agent: str):
         self.settings = settings
         self.agent = agent
+        self._chat_labels: dict[str, str] = {}
 
     def run(
         self,
@@ -116,10 +117,49 @@ class TmuxSessionRuntime:
         return f"PLA_REPLY_START_{run_id}", f"PLA_REPLY_END_{run_id}"
 
     def session_name(self, chat_id: str) -> str:
-        safe_chat = re.sub(r"[^A-Za-z0-9_.-]+", "-", chat_id or "unknown").strip("-")
-        if len(safe_chat) > 48:
-            safe_chat = safe_chat[:48]
-        return f"pla-{self.agent}-{safe_chat}"
+        label = self._chat_labels.get(chat_id)
+        # Short suffix from chat_id for uniqueness (handles duplicate group names).
+        suffix = re.sub(r"[^A-Za-z0-9]+", "", chat_id)[-6:]
+        if label:
+            safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "-", label).strip("-")[:32]
+            name = f"pla-{self.agent}-{safe_label}-{suffix}"
+        else:
+            safe_chat = re.sub(r"[^A-Za-z0-9_.-]+", "-", chat_id).strip("-")[:48]
+            name = f"pla-{self.agent}-{safe_chat}"
+        # Migrate: if a session exists under the old chat_id-based name,
+        # rename it to the new human-readable name.
+        if label:
+            old_name = f"pla-{self.agent}-{re.sub(r'[^A-Za-z0-9_.-]+', '-', chat_id).strip('-')[:48]}"
+            if old_name != name and self.session_exists(old_name) and not self.session_exists(name):
+                self._migrate_session_name(old_name, name)
+        return name
+
+    def set_chat_label(self, chat_id: str, label: str) -> None:
+        """Register a human-readable label (e.g. group name) for a chat_id."""
+        if label and label != chat_id:
+            self._chat_labels[chat_id] = label
+
+    def _migrate_session_name(self, old_name: str, new_name: str) -> None:
+        """Rename tmux session and metadata file from old to new name."""
+        try:
+            subprocess.run(
+                ["tmux", "rename-session", "-t", old_name, new_name],
+                text=True, capture_output=True, check=True,
+            )
+            LOGGER.info("renamed tmux session %s -> %s", old_name, new_name)
+        except subprocess.CalledProcessError:
+            return
+        old_meta = self.settings.state_dir / "tmux" / f"{old_name}.json"
+        new_meta = self.settings.state_dir / "tmux" / f"{new_name}.json"
+        if old_meta.exists() and not new_meta.exists():
+            data = json.loads(old_meta.read_text(encoding="utf-8"))
+            data["session_name"] = new_name
+            new_meta.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            old_meta.unlink()
+        old_log = self.settings.state_dir / "tmux" / f"{old_name}.log"
+        new_log = self.settings.state_dir / "tmux" / f"{new_name}.log"
+        if old_log.exists() and not new_log.exists():
+            old_log.rename(new_log)
 
     def find_marked_reply(self, chat_id: str, start_marker: str, end_marker: str) -> str | None:
         """Recover a finished reply from the session transcript (JSONL).

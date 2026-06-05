@@ -377,6 +377,14 @@ class LarkCLI:
         cmd.extend(["--idempotency-key", _idempotency_key(task.summary, description, task.due or "")])
         return self._run_json(cmd)
 
+    def list_chats(self) -> list[dict[str, Any]]:
+        """List all group chats this bot is a member of."""
+        result = self._run_json([
+            *self._base_cmd(), "im", "+chat-list", "--as", "bot",
+        ])
+        data = result.get("data") or {}
+        return data.get("chats") or data.get("items") or []
+
     def create_chat(
         self,
         name: str,

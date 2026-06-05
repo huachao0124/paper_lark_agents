@@ -226,6 +226,7 @@ class PaperAgentBridge:
         # Track active turn cards to avoid creating duplicates when a second
         # message arrives while the agent is still busy.
         self._active_turn_cards: dict[str, TurnCard] = {}
+        self._turn_card_lock = threading.Lock()
         self._recent_handoff_sigs: set[str] = set()
         # Follow-up poller state: per (agent, chat_id), the transcript cursor
         # to watch for additional end_turn messages after the first reply.
@@ -354,7 +355,8 @@ class PaperAgentBridge:
                 if not still_busy:
                     if card:
                         self._render_turn_card(card, "failed", "超时未完成，请重试。")
-                        self._active_turn_cards.pop(f"{card.agent}:{card.chat_id}", None)
+                        with self._turn_card_lock:
+            self._active_turn_cards.pop(f"{card.agent}:{card.chat_id}", None)
                     self.pending_runs.mark_done(run.run_id, status="timeout")
                     LOGGER.info("pending run %s timed out after %.0fs (agent idle)", run.run_id, age)
                     return
@@ -1774,30 +1776,30 @@ class PaperAgentBridge:
     def start_turn_card(
         self, chat_id: str, agent: str, model: str, effort: str, *, force: bool = False,
     ) -> TurnCard | None:
-        # One card per (agent, chat). If there's already one running:
-        # - force=True (human message): collapse the old card, create new one
-        # - force=False (handoff): skip, let it queue without a card
+        # One card per (agent, chat). The entire check→create→register sequence
+        # is under a lock so concurrent event threads don't race.
         card_key = f"{agent}:{chat_id}"
-        if card_key in self._active_turn_cards:
-            if not force:
+        with self._turn_card_lock:
+            if card_key in self._active_turn_cards:
+                if not force:
+                    return None
+                old = self._active_turn_cards.pop(card_key)
+                self._render_turn_card(old, "pending", "新消息到达,排队中…")
+            agent_name = self.agent_display_name(agent)
+            started_at = time.time()
+            card = turn_reply_card(agent_name, "running", "✻ 思考中", model=model, effort=effort, started_at=started_at)
+            try:
+                result = self.lark.send_card(chat_id, card)
+            except LarkCLIError as exc:
+                LOGGER.warning("turn card send failed: %s", exc)
                 return None
-            old = self._active_turn_cards.pop(card_key)
-            self._render_turn_card(old, "pending", "新消息到达,排队中…")
-        agent_name = self.agent_display_name(agent)
-        started_at = time.time()
-        card = turn_reply_card(agent_name, "running", "✻ 思考中", model=model, effort=effort, started_at=started_at)
-        try:
-            result = self.lark.send_card(chat_id, card)
-        except LarkCLIError as exc:
-            LOGGER.warning("turn card send failed: %s", exc)
-            return None
-        message_id = first_field(result, "message_id") or first_field(result, "id")
-        if not message_id:
-            return None
-        self.outbox.remember_message_id(chat_id, str(message_id), agent=agent, discussion_trigger=False)
-        turn_card = TurnCard(str(message_id), chat_id, agent, agent_name, model, effort, started_at)
-        self._active_turn_cards[card_key] = turn_card
-        return turn_card
+            message_id = first_field(result, "message_id") or first_field(result, "id")
+            if not message_id:
+                return None
+            self.outbox.remember_message_id(chat_id, str(message_id), agent=agent, discussion_trigger=False)
+            turn_card = TurnCard(str(message_id), chat_id, agent, agent_name, model, effort, started_at)
+            self._active_turn_cards[card_key] = turn_card
+            return turn_card
 
     def _render_turn_card(self, card: TurnCard, state: str, body: str) -> bool:
         rendered = turn_reply_card(
@@ -1981,6 +1983,7 @@ class PaperAgentBridge:
     ) -> None:
         if self.is_no_reply(text):
             self._render_turn_card(card, "skipped", "—")
+            with self._turn_card_lock:
             self._active_turn_cards.pop(f"{card.agent}:{card.chat_id}", None)
             return
         limit = self.settings.max_message_chars
@@ -2005,7 +2008,8 @@ class PaperAgentBridge:
         if self.settings.enable_memory:
             self.memory.append_assistant(card.chat_id, route.agent, text)
         # Release the card slot so the next queued message can get its own card.
-        self._active_turn_cards.pop(f"{card.agent}:{card.chat_id}", None)
+        with self._turn_card_lock:
+            self._active_turn_cards.pop(f"{card.agent}:{card.chat_id}", None)
 
     def start_agent_status(
         self,

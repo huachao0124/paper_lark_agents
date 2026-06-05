@@ -272,6 +272,25 @@ class SubagentNarrationTests(unittest.TestCase):
         ]
         self.assertEqual(claude_reply_from_lines(lines).text, "Here is the answer.")
 
+    def test_narration_delivered_before_terminal(self):
+        # Turn is still at the subagent dispatch (no end_turn yet); the stage-1
+        # narration must be delivered now, not held until the subagent finishes.
+        lines = [
+            self._text("Stage-1 analysis here.", "tool_use"),
+            self._tool("Agent"),  # last message, non-terminal stop_reason
+        ]
+        result = claude_reply_from_lines(lines)
+        self.assertIsNotNone(result)
+        self.assertIn("Stage-1 analysis here.", result.text)
+
+    def test_non_terminal_without_subagent_waits(self):
+        # Mid-turn with a normal tool and no subagent → keep waiting (None).
+        lines = [
+            self._text("Let me read the file.", "tool_use"),
+            self._tool("Read"),
+        ]
+        self.assertIsNone(claude_reply_from_lines(lines))
+
     def test_followup_subagent_narration_delivered(self):
         lines = [
             self._text("Follow-up analysis, launching another agent.", "tool_use"),

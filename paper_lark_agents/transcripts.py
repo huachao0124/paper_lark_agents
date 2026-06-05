@@ -90,20 +90,22 @@ def claude_reply_from_lines(lines: list[dict]) -> TurnResult | None:
     if not messages:
         return None
     last = messages[-1]
-    if last.get("stop_reason") not in CLAUDE_TERMINAL_STOP_REASONS:
-        return None  # still generating / awaiting a tool result
-    text = _claude_message_text(last)
-    if _dispatches_task_subagent(messages):
-        # The substantive narration lives in the message that launched the Task
-        # (stop_reason=tool_use); include every text block so the human always
-        # sees the full reply in the group, independent of any codex handoff.
-        combined = "\n\n".join(t for m in messages if (t := _claude_message_text(m))).strip()
-        if combined:
-            text = combined
-    elif not text:
-        # Final message carried no text (answer was in an earlier block before a
-        # tool call) — fall back to all assistant text in this turn.
-        text = "\n".join(t for m in messages if (t := _claude_message_text(m))).strip()
+    dispatched = _dispatches_task_subagent(messages)
+    if last.get("stop_reason") not in CLAUDE_TERMINAL_STOP_REASONS and not dispatched:
+        return None  # still generating / awaiting a (non-subagent) tool result
+    if dispatched:
+        # Subagent launched: the narration before it is a complete stage. Deliver
+        # it now — don't wait for the (possibly minutes-away) terminal — so the
+        # human sees stage 1 immediately; the result arrives as a follow-up stage.
+        text = "\n\n".join(t for m in messages if (t := _claude_message_text(m))).strip()
+    else:
+        text = _claude_message_text(last)
+        if not text:
+            # Final message carried no text (answer was in an earlier block before
+            # a tool call) — fall back to all assistant text in this turn.
+            text = "\n".join(t for m in messages if (t := _claude_message_text(m))).strip()
+    if not text:
+        return None
     usage = last.get("usage") if isinstance(last.get("usage"), dict) else None
     return TurnResult(text=text, usage=usage)
 
@@ -128,15 +130,15 @@ def claude_followup_from_lines(lines: list[dict]) -> TurnResult | None:
     if not messages:
         return None
     last = messages[-1]
-    if last.get("stop_reason") not in CLAUDE_TERMINAL_STOP_REASONS:
+    dispatched = _dispatches_task_subagent(messages)
+    if last.get("stop_reason") not in CLAUDE_TERMINAL_STOP_REASONS and not dispatched:
         return None
-    text = _claude_message_text(last)
-    if _dispatches_task_subagent(messages):
+    if dispatched:
         # A follow-up stage can itself narrate then launch another subagent;
-        # include all its text so that narration isn't dropped either.
-        combined = "\n\n".join(t for m in messages if (t := _claude_message_text(m))).strip()
-        if combined:
-            text = combined
+        # deliver that narration as its own stage (don't wait for the result).
+        text = "\n\n".join(t for m in messages if (t := _claude_message_text(m))).strip()
+    else:
+        text = _claude_message_text(last)
     if not text:
         return None
     usage = last.get("usage") if isinstance(last.get("usage"), dict) else None

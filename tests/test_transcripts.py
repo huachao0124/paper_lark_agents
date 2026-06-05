@@ -11,6 +11,7 @@ from paper_lark_agents.transcripts import (
     encode_claude_project_dir,
     find_claude_session_file,
     find_codex_rollout,
+    find_codex_rollout_by_id,
     read_new_jsonl,
     rollout_cwd,
 )
@@ -165,6 +166,39 @@ class LocatorTests(unittest.TestCase):
             self.assertEqual(rollout_cwd(good), "/ws")
             self.assertEqual(find_codex_rollout(root, Path("/ws")), good)
             self.assertIsNone(find_codex_rollout(root, Path("/nope")))
+
+    def test_find_codex_rollout_by_id_ignores_cwd(self):
+        # A migrated / workspace-switched rollout keeps its original cwd, so
+        # cwd matching fails; locating it by session id must still work.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            day = root / "2026" / "06" / "05"
+            day.mkdir(parents=True)
+            sid = "019e958a-5b51-7230-9fbc-fe1529d8bd5a"
+            target = day / f"rollout-2026-06-05T02-08-56-{sid}.jsonl"
+            target.write_text(
+                json.dumps({"type": "session_meta", "payload": {"id": sid, "cwd": "/server/path"}}) + "\n",
+                encoding="utf-8",
+            )
+            # cwd matching can't find it under the live (different) workspace.
+            self.assertIsNone(find_codex_rollout(root, Path("/Users/me/code")))
+            # id matching finds it regardless of cwd.
+            self.assertEqual(find_codex_rollout_by_id(root, sid), target)
+            self.assertIsNone(find_codex_rollout_by_id(root, "missing-id"))
+            self.assertIsNone(find_codex_rollout_by_id(root, ""))
+
+    def test_find_codex_rollout_by_id_slow_path_reads_session_meta(self):
+        # Filename without the id suffix: fall back to reading session_meta.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            day = root / "2026" / "06" / "05"
+            day.mkdir(parents=True)
+            target = day / "rollout-legacy-name.jsonl"
+            target.write_text(
+                json.dumps({"type": "session_meta", "payload": {"id": "xyz", "cwd": "/x"}}) + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(find_codex_rollout_by_id(root, "xyz"), target)
 
 
 class IncrementalReadTests(unittest.TestCase):

@@ -26,6 +26,7 @@ from .transcripts import (
     find_claude_recent_session_file,
     find_claude_session_file,
     find_codex_rollout,
+    find_codex_rollout_by_id,
     read_new_jsonl,
     rollout_session_id,
 )
@@ -985,12 +986,20 @@ Do not edit local files or run long experiments unless a human explicitly asks."
         path: Path | None = None
         if self.agent == "codex":
             created = metadata_float(meta, "created_at") or 0.0
-            path = find_codex_rollout(
-                self.codex_sessions_root(), workspace, min_mtime=max(0.0, created - 5)
-            )
+            existing = meta.get("session_uuid")
+            # Prefer id-based lookup: the rollout's session_meta.cwd is frozen at
+            # creation, so cwd matching breaks after a `/workspace` switch or a
+            # cross-machine migration. Matching the known session id is stable.
+            if isinstance(existing, str) and existing.strip():
+                path = find_codex_rollout_by_id(
+                    self.codex_sessions_root(), existing.strip()
+                )
+            if path is None:
+                path = find_codex_rollout(
+                    self.codex_sessions_root(), workspace, min_mtime=max(0.0, created - 5)
+                )
             # Capture codex's session id from its rollout so it can be resumed
             # later (codex picks a fresh id per launch; we don't control it).
-            existing = meta.get("session_uuid")
             if path is not None and not (isinstance(existing, str) and existing.strip()):
                 sid = rollout_session_id(path)
                 if sid:

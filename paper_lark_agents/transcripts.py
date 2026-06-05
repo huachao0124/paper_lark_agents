@@ -369,6 +369,37 @@ def find_codex_rollout(sessions_root: Path, workspace: Path, min_mtime: float = 
     return best[1] if best else None
 
 
+def find_codex_rollout_by_id(sessions_root: Path, session_id: str) -> Path | None:
+    """Locate a Codex rollout by its session_meta id, ignoring cwd.
+
+    `find_codex_rollout` matches on the rollout's frozen session_meta.cwd, which
+    breaks whenever the live workspace differs from where the session was first
+    created — after a `/workspace` switch or a cross-machine migration. When the
+    session id is known we match on it directly, which is stable across both.
+    """
+    if not session_id:
+        return None
+    # Fast path: the id is embedded in the rollout filename.
+    direct = glob.glob(str(sessions_root / "*" / "*" / "*" / f"rollout-*-{session_id}.jsonl"))
+    best: tuple[float, Path] | None = None
+    for raw in direct:
+        path = Path(raw)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if best is None or mtime > best[0]:
+            best = (mtime, path)
+    if best is not None:
+        return best[1]
+    # Slow path: filename convention may differ — read each session_meta id.
+    for raw in glob.glob(str(sessions_root / "*" / "*" / "*" / "rollout-*.jsonl")):
+        path = Path(raw)
+        if rollout_session_id(path) == session_id:
+            return path
+    return None
+
+
 # ---------------------------------------------------------------- incremental read
 
 def read_new_jsonl(path: Path, offset: int) -> tuple[list[dict], int]:

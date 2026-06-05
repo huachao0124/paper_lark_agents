@@ -428,8 +428,15 @@ class TmuxSessionRuntime:
 
     def detect_effort(self, chat_id: str) -> str | None:
         session_name = self.session_name(chat_id)
+        # Prefer JSONL transcript — codex records reasoning effort in turn_context.
+        transcript = self._read_recent_transcript(session_name, chat_id)
+        if transcript:
+            from .transcripts import claude_effort_from_lines, codex_effort_from_lines
+            effort = (codex_effort_from_lines if self.agent == "codex" else claude_effort_from_lines)(transcript)
+            if effort:
+                return effort
         if not self.session_exists(session_name):
-            return None
+            return metadata_string(self.read_metadata(session_name), "detected_effort", "effort")
         try:
             detected = parse_session_effort(self.capture_with_transcript(session_name), self.agent)
         except subprocess.CalledProcessError:

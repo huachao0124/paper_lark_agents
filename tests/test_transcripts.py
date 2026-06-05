@@ -5,8 +5,10 @@ import unittest
 
 from paper_lark_agents.transcripts import (
     activity_detail,
+    claude_effort_from_lines,
     claude_followup_from_lines,
     claude_reply_from_lines,
+    codex_effort_from_lines,
     codex_reply_from_lines,
     encode_claude_project_dir,
     find_claude_session_file,
@@ -225,6 +227,31 @@ class IncrementalReadTests(unittest.TestCase):
             p.write_text('not json\n{"ok":1}\n', encoding="utf-8")
             objs, _ = read_new_jsonl(p, 0)
             self.assertEqual(objs, [{"ok": 1}])
+
+
+class EffortParseTests(unittest.TestCase):
+    def test_codex_effort_from_turn_context(self):
+        lines = [
+            {"type": "session_meta", "payload": {"id": "x"}},
+            {"type": "turn_context", "payload": {"model": "gpt-5.5", "effort": "xhigh"}},
+        ]
+        self.assertEqual(codex_effort_from_lines(lines), "xhigh")
+
+    def test_codex_effort_uses_most_recent_turn_context(self):
+        lines = [
+            {"type": "turn_context", "payload": {"effort": "high"}},
+            {"type": "turn_context", "payload": {"effort": "xhigh"}},
+        ]
+        self.assertEqual(codex_effort_from_lines(lines), "xhigh")
+
+    def test_codex_effort_absent_returns_none(self):
+        self.assertIsNone(codex_effort_from_lines([{"type": "turn_context", "payload": {}}]))
+
+    def test_claude_effort_not_recorded(self):
+        # Claude's transcript never carries an effort level.
+        self.assertIsNone(claude_effort_from_lines([
+            {"type": "assistant", "message": {"model": "claude-opus-4-8", "stop_reason": "end_turn"}},
+        ]))
 
 
 if __name__ == "__main__":

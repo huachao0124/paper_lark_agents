@@ -275,6 +275,26 @@ def codex_model_from_lines(lines: list[dict]) -> str | None:
     return None
 
 
+def codex_effort_from_lines(lines: list[dict]) -> str | None:
+    """Extract the reasoning effort from Codex rollout lines.
+
+    Codex records it as `turn_context.payload.effort` (e.g. "xhigh"). Read the
+    most recent turn_context so a mid-session `/effort` change is reflected.
+    """
+    for o in reversed(lines):
+        if o.get("type") == "turn_context":
+            effort = (o.get("payload") or {}).get("effort")
+            if effort and isinstance(effort, str):
+                return effort
+    return None
+
+
+def claude_effort_from_lines(lines: list[dict]) -> str | None:
+    """Claude's transcript does not record the thinking/effort level — only the
+    model, token usage, and thinking *content* — so it cannot be detected here."""
+    return None
+
+
 def encode_claude_project_dir(workspace: Path) -> str:
     """Claude encodes the cwd into the project dir name by replacing every run
     of non-alphanumeric chars with a single dash (leading dash kept)."""

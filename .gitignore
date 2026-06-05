@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.state/
+logs/
+.run/
+*.egg-info/
+.lark_uploads/
+.env.codex
+.env.claude

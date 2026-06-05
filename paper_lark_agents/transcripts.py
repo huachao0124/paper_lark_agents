@@ -54,6 +54,31 @@ def _claude_message_text(message: dict) -> str:
     return "\n".join(parts).strip()
 
 
+# Tool names Claude uses to launch a background subagent/teammate. "Task" is
+# the standard Claude Code tool; "Agent" is the experimental agent-teams mode
+# (CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS / --teammate-mode).
+_SUBAGENT_TOOL_NAMES = {"Task", "Agent"}
+
+
+def _dispatches_task_subagent(messages: list[dict]) -> bool:
+    """True if any assistant message in this turn launched a background subagent.
+
+    When Claude writes a substantive reply and then launches a teammate in the
+    *same* turn, that text-bearing message's stop_reason is "tool_use" (not
+    terminal), so the narration would otherwise be dropped and the human would
+    only see the short "dispatched it" terminal note.
+    """
+    for message in messages:
+        for block in message.get("content") or []:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("name") in _SUBAGENT_TOOL_NAMES
+            ):
+                return True
+    return False
+
+
 def claude_reply_from_lines(lines: list[dict]) -> TurnResult | None:
     """Return the finished reply from new Claude jsonl lines, or None if the
     turn has not completed yet."""
@@ -68,7 +93,14 @@ def claude_reply_from_lines(lines: list[dict]) -> TurnResult | None:
     if last.get("stop_reason") not in CLAUDE_TERMINAL_STOP_REASONS:
         return None  # still generating / awaiting a tool result
     text = _claude_message_text(last)
-    if not text:
+    if _dispatches_task_subagent(messages):
+        # The substantive narration lives in the message that launched the Task
+        # (stop_reason=tool_use); include every text block so the human always
+        # sees the full reply in the group, independent of any codex handoff.
+        combined = "\n\n".join(t for m in messages if (t := _claude_message_text(m))).strip()
+        if combined:
+            text = combined
+    elif not text:
         # Final message carried no text (answer was in an earlier block before a
         # tool call) — fall back to all assistant text in this turn.
         text = "\n".join(t for m in messages if (t := _claude_message_text(m))).strip()
@@ -99,6 +131,12 @@ def claude_followup_from_lines(lines: list[dict]) -> TurnResult | None:
     if last.get("stop_reason") not in CLAUDE_TERMINAL_STOP_REASONS:
         return None
     text = _claude_message_text(last)
+    if _dispatches_task_subagent(messages):
+        # A follow-up stage can itself narrate then launch another subagent;
+        # include all its text so that narration isn't dropped either.
+        combined = "\n\n".join(t for m in messages if (t := _claude_message_text(m))).strip()
+        if combined:
+            text = combined
     if not text:
         return None
     usage = last.get("usage") if isinstance(last.get("usage"), dict) else None

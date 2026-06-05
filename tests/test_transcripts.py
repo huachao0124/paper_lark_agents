@@ -229,6 +229,59 @@ class IncrementalReadTests(unittest.TestCase):
             self.assertEqual(objs, [{"ok": 1}])
 
 
+class SubagentNarrationTests(unittest.TestCase):
+    def _text(self, text, stop_reason):
+        return {"type": "assistant", "message": {
+            "role": "assistant", "stop_reason": stop_reason,
+            "content": [{"type": "text", "text": text}]}}
+
+    def _tool(self, name):
+        return {"type": "assistant", "message": {
+            "role": "assistant", "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "name": name, "id": "t1", "input": {}}]}}
+
+    def test_subagent_narration_delivered_agent_tool(self):
+        # Claude narrates, then launches a teammate via the "Agent" tool, then a
+        # short terminal note. The narration must not be dropped.
+        lines = [
+            self._text("Here is my full analysis.", "tool_use"),
+            self._tool("Agent"),
+            {"type": "user", "message": {"role": "user", "content": []}},
+            self._text("Dispatched the subagent.", "end_turn"),
+        ]
+        result = claude_reply_from_lines(lines)
+        self.assertIsNotNone(result)
+        self.assertIn("Here is my full analysis.", result.text)
+        self.assertIn("Dispatched the subagent.", result.text)
+
+    def test_task_tool_name_also_detected(self):
+        lines = [
+            self._text("Analysis before task.", "tool_use"),
+            self._tool("Task"),
+            self._text("Launched.", "end_turn"),
+        ]
+        self.assertIn("Analysis before task.", claude_reply_from_lines(lines).text)
+
+    def test_normal_tool_turn_not_concatenated(self):
+        # No subagent: intermediate narration stays out; only the terminal text.
+        lines = [
+            self._text("Let me read the file.", "tool_use"),
+            self._tool("Read"),
+            {"type": "user", "message": {"role": "user", "content": []}},
+            self._text("Here is the answer.", "end_turn"),
+        ]
+        self.assertEqual(claude_reply_from_lines(lines).text, "Here is the answer.")
+
+    def test_followup_subagent_narration_delivered(self):
+        lines = [
+            self._text("Follow-up analysis, launching another agent.", "tool_use"),
+            self._tool("Agent"),
+            self._text("Second one dispatched.", "end_turn"),
+        ]
+        result = claude_followup_from_lines(lines)
+        self.assertIn("Follow-up analysis", result.text)
+
+
 class EffortParseTests(unittest.TestCase):
     def test_codex_effort_from_turn_context(self):
         lines = [

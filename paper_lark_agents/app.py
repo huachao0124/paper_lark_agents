@@ -224,6 +224,7 @@ class PaperAgentBridge:
         # Track active turn cards to avoid creating duplicates when a second
         # message arrives while the agent is still busy.
         self._active_turn_cards: dict[str, TurnCard] = {}
+        self._recent_handoff_sigs: set[str] = set()
         # Follow-up poller state: per (agent, chat_id), the transcript cursor
         # to watch for additional end_turn messages after the first reply.
         self._followup_cursors: dict[str, tuple[str, int, MessageEvent, Route, str | None, int]] = {}
@@ -2039,8 +2040,6 @@ class PaperAgentBridge:
         # enqueue_teammate_handoff are the hard backstop.
         peer = "claude" if route.agent == "codex" else "codex"
         return peer in addressed_agents(reply)
-
-    _recent_handoff_sigs: set[str] = set()
 
     def enqueue_teammate_handoff(
         self,

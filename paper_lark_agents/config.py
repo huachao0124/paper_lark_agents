@@ -146,6 +146,7 @@ class Settings:
     agent_proxy_url: str | None
     no_proxy: str | None
     chat_id: str | None
+    chat_id_exclude: tuple[str, ...]
     bot_open_id: str | None
     agent_mode: AgentMode
     bot_aliases: tuple[str, ...]
@@ -230,6 +231,7 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         agent_proxy_url=_optional("PLA_AGENT_PROXY_URL"),
         no_proxy=_env("PLA_NO_PROXY", "localhost,127.0.0.1,::1"),
         chat_id=_optional("PLA_CHAT_ID"),
+        chat_id_exclude=tuple(s.strip() for s in os.environ.get("PLA_CHAT_ID_EXCLUDE", "").split(",") if s.strip()),
         bot_open_id=_optional("PLA_BOT_OPEN_ID"),
         agent_mode=agent_mode,  # type: ignore[arg-type]
         bot_aliases=bot_aliases,

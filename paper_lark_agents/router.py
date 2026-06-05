@@ -15,6 +15,7 @@ RouteKind = Literal[
     "workspace",
     "clear",
     "responder",
+    "import_memory",
     "session_command",
 ]
 AgentName = Literal["codex", "claude"]
@@ -48,6 +49,7 @@ HELP_TEXT = """Available commands:
 /claude <question>
 /both <question> — send to both agents at once
 /debate <paper, claim, or question>
+/import <source_chat_id> — import room memory from another group
 /workspace [path|reset]
 /responder [codex|claude|both|reset]
 /clear [init]
@@ -109,6 +111,11 @@ def route_message(
         remainder = _strip_prefix(command_text, command_lowered, prefix)
         if remainder is not None:
             return Route("responder", text=remainder)
+
+    for prefix in ("/import", "!import"):
+        remainder = _strip_prefix(command_text, command_lowered, prefix)
+        if remainder is not None:
+            return Route("import_memory", text=remainder)
 
     multi_agent_commands = split_multi_agent_directives(text)
     if multi_agent_commands and all(

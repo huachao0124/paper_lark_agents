@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 import logging
 from pathlib import Path
+import re
 import threading
 import time
 from typing import Any
@@ -489,7 +490,7 @@ class PaperAgentBridge:
         chat_id = event.chat_id
         if not chat_id:
             return
-        if self.settings.chat_id and chat_id != self.settings.chat_id:
+        if not self._chat_allowed(chat_id):
             return
         LOGGER.info("bot added to %s; waiting for /workspace before warming sessions", chat_id)
 
@@ -497,7 +498,7 @@ class PaperAgentBridge:
         chat_id = event.chat_id
         if not chat_id:
             return
-        if self.settings.chat_id and chat_id != self.settings.chat_id:
+        if not self._chat_allowed(chat_id):
             return
         for agent in self.enabled_agents:
             if self.agent_runtime(agent) != "session":
@@ -509,8 +510,15 @@ class PaperAgentBridge:
                 continue
             LOGGER.info("reset %s session for closed chat %s on %s", agent, chat_id, event.event_type)
 
+    def _chat_allowed(self, chat_id: str) -> bool:
+        if self.settings.chat_id and chat_id != self.settings.chat_id:
+            return False
+        if chat_id in self.settings.chat_id_exclude:
+            return False
+        return True
+
     def handle_event(self, event: MessageEvent) -> None:
-        if self.settings.chat_id and event.chat_id != self.settings.chat_id:
+        if not self._chat_allowed(event.chat_id):
             return
         if self.settings.bot_open_id and event.sender_id == self.settings.bot_open_id:
             return
@@ -740,6 +748,8 @@ class PaperAgentBridge:
             return self.handle_clear_command(event.chat_id, route.text)
         if route.kind == "responder":
             return self.handle_responder_command(event.chat_id, route.text)
+        if route.kind == "import_memory":
+            return self.handle_import_memory(event.chat_id, route.text)
         if route.kind == "session_command":
             assert route.agent is not None
             return self.handle_session_command(route.agent, event.chat_id, route.text)
@@ -1180,6 +1190,31 @@ class PaperAgentBridge:
                 return replace(route, agent_texts=allowed)
             return route
         return route
+
+    def handle_import_memory(self, chat_id: str, text: str) -> str:
+        """Import room memory from another chat_id into the current chat.
+
+        Usage: /import oc_xxx — copies history.jsonl from the source chat dir
+        into this chat's dir so agents get the prior context on their next turn.
+        """
+        source_id = text.strip()
+        if not source_id:
+            return "用法：`/import <source_chat_id>`\n将另一个群的对话记忆导入到当前群。"
+        source_dir = self.settings.state_dir / "chats" / re.sub(r"[^A-Za-z0-9_.-]+", "_", source_id)
+        source_file = source_dir / "history.jsonl"
+        if not source_file.exists():
+            return f"找不到源群记忆：`{source_id}`\n确认 `.state/chats/{source_id}/history.jsonl` 存在。"
+        target_dir = self.settings.state_dir / "chats" / re.sub(r"[^A-Za-z0-9_.-]+", "_", chat_id)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_file = target_dir / "history.jsonl"
+        existing = target_file.read_text(encoding="utf-8") if target_file.exists() else ""
+        imported = source_file.read_text(encoding="utf-8")
+        with target_file.open("a", encoding="utf-8") as f:
+            if existing and not existing.endswith("\n"):
+                f.write("\n")
+            f.write(imported)
+        n_lines = len([l for l in imported.splitlines() if l.strip()])
+        return f"已从 `{source_id}` 导入 {n_lines} 条记忆到当前群。下一条消息时 agent 会收到完整上下文。"
 
     def handle_responder_command(self, chat_id: str, text: str) -> str:
         command = text.strip()

@@ -1,5 +1,38 @@
 # Migrate paper-lark-agents to macbook
 
+Two modes:
+- **Split mode** (recommended): server handles most groups, macbook handles
+  one specific group. Both run simultaneously, no conflict.
+- **Full migration**: everything moves to macbook, server stops.
+
+## Split mode (one group on macbook)
+
+Server `.env.codex` / `.env.claude` — add:
+```
+PLA_CHAT_ID_EXCLUDE=oc_xxx   # comma-separated chat_ids to skip
+```
+
+macbook `.env.codex` / `.env.claude` — add:
+```
+PLA_CHAT_ID=oc_xxx            # only handle this group
+```
+
+Both bridges run simultaneously. Server ignores the excluded group,
+macbook only handles it. No session transcript migration needed —
+macbook creates fresh sessions and injects room memory from shared
+`.state/` (or from Feishu message history).
+
+To copy room memory for the group:
+```bash
+mkdir -p .state/chats/
+scp server:paper-lark-agents/.state/chats/<chat_id_dir> .state/chats/
+scp server:paper-lark-agents/.state/chat_responders.json .state/
+```
+
+---
+
+## Full migration
+
 This guide migrates the bridge + agent sessions from a Linux server to macbook.
 Designed to be read and executed by Codex/Claude Code on the macbook.
 

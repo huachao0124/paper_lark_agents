@@ -1672,19 +1672,17 @@ class PaperAgentBridge:
         status.update(state, summary)
 
     def start_turn_card(self, chat_id: str, agent: str, model: str, effort: str) -> TurnCard | None:
-        # If there's already an active card for this agent+chat (in memory or
-        # in pending_runs with a card), collapse the old one so we don't get
-        # duplicate running cards.
+        # Only one card per (agent, chat) at a time. If there's already one
+        # running (in memory or in pending_runs), skip creating a new one.
+        # The queued message will be processed after the current turn finishes
+        # and the pending_run_loop will handle sending the reply.
         card_key = f"{agent}:{chat_id}"
-        old_card = self._active_turn_cards.pop(card_key, None)
-        if not old_card:
-            # Check persistent pending_runs — covers daemon restart.
-            for run in self.pending_runs.pending_for(agent):
-                if run.chat_id == chat_id and run.status_message_id:
-                    old_card = TurnCard(run.status_message_id, chat_id, agent, self.agent_display_name(agent), "", "", 0)
-                    break
-        if old_card:
-            self._render_turn_card(old_card, "pending", "新消息到达,排队中…")
+        if card_key in self._active_turn_cards:
+            return None
+        # Also check persistent pending_runs — covers daemon restart.
+        for run in self.pending_runs.pending_for(agent):
+            if run.chat_id == chat_id and run.status_message_id:
+                return None
         agent_name = self.agent_display_name(agent)
         started_at = time.time()
         card = turn_reply_card(agent_name, "running", "✻ 思考中", model=model, effort=effort, started_at=started_at)

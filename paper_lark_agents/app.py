@@ -1951,12 +1951,8 @@ class PaperAgentBridge:
         return message_id
 
     def pin_status_dashboard_message(self, chat_id: str, message_id: str) -> None:
-        try:
-            self.dashboard_lark().pin_message(message_id)
-        except LarkCLIError as exc:
-            LOGGER.warning("status dashboard pin failed for %s: %s", message_id, exc)
-            return
-        self.status_dashboards.mark_pinned(chat_id, message_id)
+        # Disabled: pinned status cards are deprecated in favor of per-turn cards.
+        pass
 
     def update_status_dashboard(self, handle: StatusHandle, state: str, detail: str) -> None:
         snapshot = self.status_dashboards.update_status(

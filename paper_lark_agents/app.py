@@ -1672,11 +1672,17 @@ class PaperAgentBridge:
         status.update(state, summary)
 
     def start_turn_card(self, chat_id: str, agent: str, model: str, effort: str) -> TurnCard | None:
-        # If there's already an active card for this agent+chat, collapse the
-        # old one to "排队中" so the new card appears at the correct position
-        # (below the user's latest message).
+        # If there's already an active card for this agent+chat (in memory or
+        # in pending_runs with a card), collapse the old one so we don't get
+        # duplicate running cards.
         card_key = f"{agent}:{chat_id}"
         old_card = self._active_turn_cards.pop(card_key, None)
+        if not old_card:
+            # Check persistent pending_runs — covers daemon restart.
+            for run in self.pending_runs.pending_for(agent):
+                if run.chat_id == chat_id and run.status_message_id:
+                    old_card = TurnCard(run.status_message_id, chat_id, agent, self.agent_display_name(agent), "", "", 0)
+                    break
         if old_card:
             self._render_turn_card(old_card, "pending", "新消息到达,排队中…")
         agent_name = self.agent_display_name(agent)

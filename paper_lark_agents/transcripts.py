@@ -256,6 +256,25 @@ def codex_reply_from_lines(lines: list[dict]) -> TurnResult | None:
 
 # ---------------------------------------------------------------- locating
 
+def claude_model_from_lines(lines: list[dict]) -> str | None:
+    """Extract the model name from Claude JSONL lines."""
+    for o in reversed(lines):
+        model = (o.get("message") or {}).get("model")
+        if model and isinstance(model, str):
+            return model
+    return None
+
+
+def codex_model_from_lines(lines: list[dict]) -> str | None:
+    """Extract the model name from Codex rollout lines."""
+    for o in lines:
+        if o.get("type") == "turn_context":
+            model = (o.get("payload") or {}).get("model") or o.get("model")
+            if model and isinstance(model, str):
+                return model
+    return None
+
+
 def encode_claude_project_dir(workspace: Path) -> str:
     """Claude encodes the cwd into the project dir name by replacing every run
     of non-alphanumeric chars with a single dash (leading dash kept)."""

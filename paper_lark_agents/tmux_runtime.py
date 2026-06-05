@@ -384,8 +384,15 @@ class TmuxSessionRuntime:
 
     def detect_model(self, chat_id: str) -> str | None:
         session_name = self.session_name(chat_id)
+        # Prefer JSONL transcript — reliable, no tmux screen scraping needed.
+        transcript = self._read_recent_transcript(session_name, chat_id)
+        if transcript:
+            from .transcripts import claude_model_from_lines, codex_model_from_lines
+            model = (codex_model_from_lines if self.agent == "codex" else claude_model_from_lines)(transcript)
+            if model:
+                return model
         if not self.session_exists(session_name):
-            return None
+            return metadata_string(self.read_metadata(session_name), "detected_model", "model")
         try:
             detected = parse_session_model(self.capture_with_transcript(session_name), self.agent)
         except subprocess.CalledProcessError:
@@ -393,6 +400,30 @@ class TmuxSessionRuntime:
         if detected:
             return detected
         return metadata_string(self.read_metadata(session_name), "detected_model", "model")
+
+    def _read_recent_transcript(self, session_name: str, chat_id: str, max_lines: int = 50) -> list[dict] | None:
+        """Read the last N lines from the session's transcript JSONL."""
+        meta = self.read_metadata(session_name)
+        path_str = meta.get("transcript_path")
+        if not path_str:
+            return None
+        path = Path(str(path_str))
+        if not path.exists():
+            return None
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return None
+        result = []
+        for line in lines[-max_lines:]:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                result.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return result or None
 
     def detect_effort(self, chat_id: str) -> str | None:
         session_name = self.session_name(chat_id)

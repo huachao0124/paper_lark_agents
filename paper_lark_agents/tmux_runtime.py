@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import logging
 from pathlib import Path
 import re
 import shlex
@@ -33,6 +34,8 @@ from .transcripts import (
 # Bump when agent_session_context_prompt changes in a way existing long-lived
 # sessions must learn (e.g. the @peer handoff contract). A mismatch re-injects
 # the context block on the session's next turn without recreating the session.
+LOGGER = logging.getLogger(__name__)
+
 SESSION_PROMPT_VERSION = 10
 EFFORT_TOKEN_PATTERN = r"[A-Za-z][A-Za-z0-9_-]*"
 

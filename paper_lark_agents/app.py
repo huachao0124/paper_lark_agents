@@ -2050,6 +2050,8 @@ class PaperAgentBridge:
         peer = "claude" if route.agent == "codex" else "codex"
         return peer in addressed_agents(reply)
 
+    _recent_handoff_sigs: set[str] = set()
+
     def enqueue_teammate_handoff(
         self,
         event: MessageEvent,
@@ -2065,6 +2067,15 @@ class PaperAgentBridge:
             return
         if inbound_source_agent == source_agent:
             return
+        # Dedup: multiple code paths (finalize_turn_reply, followup_loop,
+        # send_reply) can try to enqueue the same reply as a handoff.
+        sig = f"{source_agent}:{event.chat_id}:{reply[:200]}"
+        if sig in self._recent_handoff_sigs:
+            return
+        self._recent_handoff_sigs.add(sig)
+        # Keep the set bounded.
+        if len(self._recent_handoff_sigs) > 200:
+            self._recent_handoff_sigs = set(list(self._recent_handoff_sigs)[-100:])
         next_depth = handoff_depth + 1
         if next_depth > max(0, self.settings.max_agent_discussion_turns):
             LOGGER.info("skipping handoff from %s; discussion depth cap reached", source_agent)

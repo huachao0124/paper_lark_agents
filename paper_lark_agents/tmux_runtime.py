@@ -531,6 +531,9 @@ class TmuxSessionRuntime:
             self.ensure_session(session_name, chat_id, workspace, model, effort)
         self.apply_model_if_needed(session_name, model)
         self.paste_and_submit(session_name, command)
+        # /model and /effort pop a confirmation that needs a second Enter.
+        if command.strip().startswith(("/model", "/effort")):
+            self._confirm_slash_dialog(session_name)
         if effort:
             self.mark_session_effort(session_name, effort)
         self.refresh_cli_session_files(session_name, chat_id)
@@ -607,10 +610,22 @@ class TmuxSessionRuntime:
             self.paste_and_submit(session_name, command)
             time.sleep(1)
 
+    def _confirm_slash_dialog(self, session_name: str) -> None:
+        """/model and /effort pop a confirmation that needs a second Enter to
+        actually apply — paste_and_submit only presses Enter once (to run the
+        command). Send the confirming Enter so no human has to. A stray Enter at
+        an empty prompt is a harmless no-op when no dialog is shown."""
+        time.sleep(1)  # let the confirmation dialog render
+        subprocess.run(
+            ["tmux", "send-keys", "-t", session_name, "Enter"],
+            text=True, capture_output=True, check=False,
+        )
+
     def apply_effort_if_needed(self, session_name: str, effort: str | None) -> None:
         if not effort or self.session_effort_matches(session_name, effort):
             return
         self.paste_and_submit(session_name, f"/effort {effort}")
+        self._confirm_slash_dialog(session_name)
         self.mark_session_effort(session_name, effort)
         time.sleep(1)
 
@@ -618,6 +633,7 @@ class TmuxSessionRuntime:
         if not model or self.session_model_matches(session_name, model):
             return
         self.paste_and_submit(session_name, f"/model {model}")
+        self._confirm_slash_dialog(session_name)
         self.mark_session_model(session_name, model)
         time.sleep(1)
 

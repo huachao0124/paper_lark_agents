@@ -30,8 +30,8 @@ class AgentRunner:
     def __init__(self, settings: Settings):
         self.settings = settings
         suffix = settings.session_suffix
-        codex_sid = f"codex-{suffix}" if suffix and settings.agent_mode in {"codex", "both"} else None
-        claude_sid = f"claude-{suffix}" if suffix and settings.agent_mode in {"claude", "both"} else None
+        codex_sid = f"codex-{suffix}" if suffix else None
+        claude_sid = f"claude-{suffix}" if suffix else None
         self.codex_session = TmuxSessionRuntime(settings, "codex", session_id=codex_sid)
         self.claude_session = TmuxSessionRuntime(settings, "claude", session_id=claude_sid)
 

@@ -618,6 +618,20 @@ class TmuxSessionRuntime:
                 continue
             self.paste_and_submit(session_name, command)
             time.sleep(1)
+            if command.strip() == "/permissions":
+                self._select_codex_menu_option(session_name, "2")
+
+    def _select_codex_menu_option(self, session_name: str, option: str) -> None:
+        time.sleep(1)
+        subprocess.run(
+            ["tmux", "send-keys", "-t", session_name, option],
+            text=True, capture_output=True, check=False,
+        )
+        time.sleep(0.5)
+        subprocess.run(
+            ["tmux", "send-keys", "-t", session_name, "Enter"],
+            text=True, capture_output=True, check=False,
+        )
 
     def _confirm_slash_dialog(self, session_name: str) -> None:
         """/model and /effort pop a confirmation that needs a second Enter to

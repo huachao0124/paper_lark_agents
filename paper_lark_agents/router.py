@@ -118,10 +118,10 @@ def route_message(
         if remainder is not None:
             return Route("import_memory", text=remainder)
 
-    # In strict alias mode, the bot's own alias is the ONLY trigger for agent
-    # routing. When the alias was not matched, skip agent commands, multi-agent
-    # directives, /both, and respond_to_all — only /debate and /task (gated by
-    # their own enable flags elsewhere) are still checked.
+    # In strict alias mode, the bot's own alias is the ONLY trigger for
+    # explicit agent routing. Skip agent commands, multi-agent directives,
+    # and /both — but still allow /debate, /task, and respond_to_all (each
+    # process uses its own default_agent so there is no cross-instance conflict).
     if strict_alias and alias_remainder is None:
         for prefix in ("/debate", "!debate", "debate:"):
             remainder = _strip_prefix(command_text, command_lowered, prefix)
@@ -138,6 +138,9 @@ def route_message(
             if remainder is not None:
                 task = parse_task_request(remainder)
                 return Route("task", text=remainder, task=task)
+        if respond_to_all:
+            if default_agent in enabled:
+                return Route("agent", text=text, agent=default_agent, broadcast=True)
         return Route("ignore")
 
     # When strict alias mode is on AND the alias was matched, route directly to

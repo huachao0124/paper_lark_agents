@@ -139,6 +139,12 @@ def route_message(
                 task = parse_task_request(remainder)
                 return Route("task", text=remainder, task=task)
         if respond_to_all:
+            # Don't broadcast messages explicitly addressed to a known agent
+            # name — let the target bot's process handle them (which returns
+            # ignore when the agent is not enabled in that process).
+            explicit = _route_explicit_agent_command(text, lowered, enabled)
+            if explicit is not None:
+                return Route("ignore")
             if default_agent in enabled:
                 return Route("agent", text=text, agent=default_agent, broadcast=True)
         return Route("ignore")

@@ -207,6 +207,8 @@ class Settings:
     session_columns: int
     session_rows: int
     session_command_watch_seconds: int
+    session_suffix: str | None
+    strict_alias_routing: bool
 
 
 def load_settings(env_file: str | None = ".env") -> Settings:
@@ -311,6 +313,8 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         session_columns=max(80, _int("PLA_SESSION_COLUMNS", 120)),
         session_rows=max(24, _int("PLA_SESSION_ROWS", 80)),
         session_command_watch_seconds=_int("PLA_SESSION_COMMAND_WATCH_SECONDS", 20),
+        session_suffix=_optional("PLA_SESSION_SUFFIX"),
+        strict_alias_routing=_bool("PLA_STRICT_ALIAS_ROUTING", False),
     )
 
 

@@ -63,9 +63,12 @@ class TmuxReply:
 
 
 class TmuxSessionRuntime:
-    def __init__(self, settings: Settings, agent: str):
+    def __init__(
+        self, settings: Settings, agent: str, session_id: str | None = None,
+    ):
         self.settings = settings
         self.agent = agent
+        self.session_id = session_id or agent
         self._chat_labels: dict[str, str] = {}
 
     def run(
@@ -122,20 +125,26 @@ class TmuxSessionRuntime:
 
     def session_name(self, chat_id: str) -> str:
         label = self._chat_labels.get(chat_id)
+        sid = self.session_id
         # Short suffix from chat_id for uniqueness (handles duplicate group names).
         suffix = re.sub(r"[^A-Za-z0-9]+", "", chat_id)[-6:]
         if label:
             safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "-", label).strip("-")[:32]
-            name = f"pla-{self.agent}-{safe_label}-{suffix}"
+            name = f"pla-{sid}-{safe_label}-{suffix}"
         else:
             safe_chat = re.sub(r"[^A-Za-z0-9_.-]+", "-", chat_id).strip("-")[:48]
-            name = f"pla-{self.agent}-{safe_chat}"
-        # Migrate: if a session exists under the old chat_id-based name,
-        # rename it to the new human-readable name.
+            name = f"pla-{sid}-{safe_chat}"
+        # Migrate: if a session exists under the old name (before session_id
+        # was introduced, or before chat labels), rename it.
         if label:
-            old_name = f"pla-{self.agent}-{re.sub(r'[^A-Za-z0-9_.-]+', '-', chat_id).strip('-')[:48]}"
+            old_name = f"pla-{sid}-{re.sub(r'[^A-Za-z0-9_.-]+', '-', chat_id).strip('-')[:48]}"
             if old_name != name and self.session_exists(old_name) and not self.session_exists(name):
                 self._migrate_session_name(old_name, name)
+        # Also migrate from the bare agent name when session_id differs.
+        if sid != self.agent:
+            old_agent_name = f"pla-{self.agent}-{re.sub(r'[^A-Za-z0-9_.-]+', '-', chat_id).strip('-')[:48]}"
+            if old_agent_name != name and self.session_exists(old_agent_name) and not self.session_exists(name):
+                self._migrate_session_name(old_agent_name, name)
         return name
 
     def set_chat_label(self, chat_id: str, label: str) -> None:

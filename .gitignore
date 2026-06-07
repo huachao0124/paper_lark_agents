@@ -7,3 +7,5 @@ logs/
 .lark_uploads/
 .env.codex
 .env.claude
+.env.codex-cvm
+.env.claude-cvm

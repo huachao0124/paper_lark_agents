@@ -73,6 +73,7 @@ def route_message(
     enabled_agents: Iterable[AgentName] = ("codex", "claude"),
     bot_aliases: Iterable[str] = (),
     default_agent: AgentName | None = None,
+    strict_alias: bool = False,
 ) -> Route:
     text = normalize_content(content)
     if not text:
@@ -86,7 +87,7 @@ def route_message(
     command_text = text
     command_lowered = lowered
     if default_agent in enabled:
-        alias_remainder = _strip_alias(text, bot_aliases)
+        alias_remainder = _strip_alias(text, bot_aliases, exact=strict_alias)
         if alias_remainder is not None:
             command_text = alias_remainder
             command_lowered = command_text.lower()
@@ -116,6 +117,36 @@ def route_message(
         remainder = _strip_prefix(command_text, command_lowered, prefix)
         if remainder is not None:
             return Route("import_memory", text=remainder)
+
+    # In strict alias mode, the bot's own alias is the ONLY trigger for agent
+    # routing. When the alias was not matched, skip agent commands, multi-agent
+    # directives, /both, and respond_to_all — only /debate and /task (gated by
+    # their own enable flags elsewhere) are still checked.
+    if strict_alias and alias_remainder is None:
+        for prefix in ("/debate", "!debate", "debate:"):
+            remainder = _strip_prefix(command_text, command_lowered, prefix)
+            if remainder is not None:
+                if respond_to_all and default_agent in enabled:
+                    return Route(
+                        "agent",
+                        text=_format_debate_broadcast_text(remainder),
+                        agent=default_agent,
+                    )
+                return Route("debate", text=remainder)
+        for prefix in ("/task", "!task", "/todo", "!todo", "task:", "todo:"):
+            remainder = _strip_prefix(command_text, command_lowered, prefix)
+            if remainder is not None:
+                task = parse_task_request(remainder)
+                return Route("task", text=remainder, task=task)
+        return Route("ignore")
+
+    # When strict alias mode is on AND the alias was matched, route directly to
+    # the default agent without checking hardcoded @codex/@claude patterns (which
+    # might steal messages addressed to another instance of the same agent type).
+    if strict_alias and alias_remainder is not None and default_agent in enabled:
+        if alias_remainder:
+            return Route("agent", text=alias_remainder, agent=default_agent)
+        return Route("ignore")
 
     multi_agent_commands = split_multi_agent_directives(text)
     if multi_agent_commands and all(
@@ -325,7 +356,9 @@ def is_raw_session_command(text: str) -> bool:
     return text.lstrip().startswith("/")
 
 
-def _strip_prefix(text: str, lowered: str, prefix: str) -> str | None:
+def _strip_prefix(
+    text: str, lowered: str, prefix: str, allow_suffix: bool = True,
+) -> str | None:
     if not lowered.startswith(prefix):
         return None
     consumed = len(prefix)
@@ -335,7 +368,7 @@ def _strip_prefix(text: str, lowered: str, prefix: str) -> str | None:
         # renders an @ of the "Codex-Mac" bot as "@Codex-Mac", so accept
         # "@codex-mac" / "/claude-mac" as addressing codex/claude. Bare names
         # ("codex-cli is great") are left alone to avoid false positives.
-        if next_char == "-" and prefix[:1] in {"@", "/", "!"}:
+        if next_char == "-" and allow_suffix and prefix[:1] in {"@", "/", "!"}:
             suffix = re.match(r"-[A-Za-z0-9]+", lowered[consumed:])
             after = consumed + suffix.end() if suffix else consumed
             if suffix and (after >= len(lowered) or _is_prefix_boundary(lowered[after])):
@@ -366,7 +399,9 @@ def _strip_leading_acknowledgement(text: str) -> str:
     )
 
 
-def _strip_alias(text: str, aliases: Iterable[str]) -> str | None:
+def _strip_alias(
+    text: str, aliases: Iterable[str], exact: bool = False,
+) -> str | None:
     lowered = text.lower()
     for raw_alias in aliases:
         alias = raw_alias.strip()
@@ -376,7 +411,9 @@ def _strip_alias(text: str, aliases: Iterable[str]) -> str | None:
         if alias.startswith("@"):
             forms.add(alias[1:])
         for form in sorted(forms, key=len, reverse=True):
-            remainder = _strip_prefix(text, lowered, form.lower())
+            remainder = _strip_prefix(
+                text, lowered, form.lower(), allow_suffix=not exact,
+            )
             if remainder is not None:
                 return remainder
     return None

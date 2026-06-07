@@ -594,6 +594,7 @@ class PaperAgentBridge:
                 enabled_agents=self.enabled_agents,
                 bot_aliases=self.settings.bot_aliases,
                 default_agent=self.default_agent,
+                strict_alias=self.settings.strict_alias_routing,
             )
         except ValueError as exc:
             self.lark.send_markdown(event.chat_id, f"Task parse error: {exc}")

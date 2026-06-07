@@ -199,3 +199,112 @@ tmux ls | grep pla-
 - Proxy settings may differ — macbook likely doesn't need `PLA_PROXY_URL`
   or `PLA_AGENT_PROXY_URL`. Set them to empty or remove.
 - `PLA_NO_PROXY` can be left empty on macbook.
+
+---
+
+## MacBook daily operations
+
+### Start (after reboot / first time)
+
+```bash
+cd ~/Desktop/code/paper_lark_agents
+
+# 1. Prevent sleep (keep running with lid open + plugged in)
+caffeinate -dimsu &
+
+# 2. Start the bridge daemon (both bots)
+python3 -m paper_lark_agents daemon-start \
+  --codex-env .env.codex --claude-env .env.claude
+
+# 3. Verify
+python3 -m paper_lark_agents daemon-status   # should show running: true
+tmux ls | grep pla-                          # sessions appear after first message
+```
+
+tmux sessions are lazy — they are created when the first group message arrives.
+To pre-create them immediately (so bots resume context before anyone messages):
+
+```bash
+python3 -c "
+import sys; sys.path.insert(0, '.')
+from paper_lark_agents.config import load_settings
+from paper_lark_agents.tmux_runtime import TmuxSessionRuntime
+from pathlib import Path
+
+chat_id = 'oc_9deced224b6349316ddaaab356d4566b'
+ws = Path('/Users/arimazhu/Desktop/code/sts2_self_improve_harness')
+
+for env, agent in [('.env.codex', 'codex'), ('.env.claude', 'claude')]:
+    rt = TmuxSessionRuntime(load_settings(env), agent)
+    rt.set_chat_label(chat_id, 'sts2_self_improve_harness')
+    sn = rt.session_name(chat_id)
+    rt.ensure_session(sn, chat_id, ws)
+    print(f'[{agent}] session ready')
+"
+```
+
+### Check status
+
+```bash
+python3 -m paper_lark_agents daemon-status
+python3 -m paper_lark_agents daemon-logs     # tail the log
+tmux ls | grep pla-                          # list agent sessions
+lark-cli event status --profile codex        # event bus health
+```
+
+### Stop
+
+```bash
+python3 -m paper_lark_agents daemon-stop
+```
+
+### Restart (apply code changes)
+
+```bash
+python3 -m paper_lark_agents daemon-stop
+python3 -m paper_lark_agents daemon-start \
+  --codex-env .env.codex --claude-env .env.claude
+```
+
+### Pull latest code + restart
+
+```bash
+cd ~/Desktop/code/paper_lark_agents
+git pull
+python3 -m paper_lark_agents daemon-stop
+python3 -m paper_lark_agents daemon-start \
+  --codex-env .env.codex --claude-env .env.claude
+```
+
+### Keep awake (prevent macOS sleep)
+
+With lid open + plugged in, `caffeinate` prevents idle sleep. The screen
+will dim/turn off (`displaysleep`) but the system stays awake.
+
+```bash
+# Start (run once after reboot, runs until killed)
+caffeinate -dimsu &
+
+# Verify
+pmset -g | grep sleep    # should show "sleep prevented by caffeinate"
+
+# For permanent no-sleep on AC power (survives reboot):
+sudo pmset -c sleep 0
+```
+
+### Troubleshooting
+
+```bash
+# Bridge not responding to messages?
+python3 -m paper_lark_agents daemon-status   # check if running
+lark-cli event status --profile codex        # check event bus
+tail -30 logs/paper-lark-agents.log          # check for errors
+
+# Agent session crashed?
+tmux ls | grep pla-                          # check if session exists
+tmux attach -t pla-claude-sts2_self_improve_harness-d4566b  # inspect
+
+# Force restart a single agent session (without restarting daemon):
+tmux kill-session -t pla-codex-sts2_self_improve_harness-d4566b
+# Session will be recreated on next message.
+```

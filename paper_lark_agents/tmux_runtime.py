@@ -539,10 +539,20 @@ class TmuxSessionRuntime:
         if not self.session_exists(session_name):
             self.ensure_session(session_name, chat_id, workspace, model, effort)
         self.apply_model_if_needed(session_name, model)
+        # Check if session is idle before sending slash commands — if busy,
+        # the command gets queued as a message and won't execute.
+        if command.strip().startswith("/"):
+            try:
+                screen = self.capture(session_name)
+                if not session_ready_for_current_input(screen, self.agent):
+                    return False
+            except (subprocess.CalledProcessError, AttributeError):
+                pass
         self.paste_and_submit(session_name, command)
-        # /model and /effort pop a confirmation that needs a second Enter.
         if command.strip().startswith(("/model", "/effort")):
             self._confirm_slash_dialog(session_name)
+        if command.strip().startswith("/permissions"):
+            self._select_codex_menu_option(session_name, "2")
         if effort:
             self.mark_session_effort(session_name, effort)
         self.refresh_cli_session_files(session_name, chat_id)

@@ -1013,7 +1013,7 @@ class PaperAgentBridge:
             )
             if sent:
                 return f"{agent_name} effort 已设为 `{effort}`（当前会话生效）。"
-            return f"{agent_name} effort 已记为 `{effort}`，下次启动会话时生效。"
+            return f"{agent_name} effort 已记为 `{effort}`，会话当前忙碌，下轮空闲时自动生效。"
         if model is not None:
             try:
                 model = self.models.set(chat_id, agent, model)
@@ -2010,19 +2010,36 @@ class PaperAgentBridge:
                 key_sent.add(sig)
                 agent = key.split(":", 1)[0]
                 LOGGER.info("follow-up reply from %s in %s", agent, event.chat_id)
-                card = None
+                # Follow-up replies are already complete — use a plain card
+                # (not streaming) to avoid sequence issues from rapid create+finalize.
                 if self.settings.send_progress:
-                    card = self.start_turn_card(
-                        event.chat_id, agent,
+                    agent_name = self.agent_display_name(agent)
+                    footer = self._turn_card_footer(TurnCard(
+                        "", event.chat_id, agent, agent_name,
                         self.chat_model_label(event.chat_id, agent),
                         self.chat_effort_label(event.chat_id, agent),
-                        force=True,
+                        time.time(),
+                    ))
+                    done_card = turn_reply_card(
+                        agent_name, "done", text[:self.settings.max_message_chars],
+                        model=self.chat_model_label(event.chat_id, agent),
+                        effort=self.chat_effort_label(event.chat_id, agent),
+                        started_at=time.time(),
                     )
-                if card:
-                    self.finalize_turn_reply(
-                        card, route, event, text,
-                        source_agent=source_agent, handoff_depth=depth,
-                    )
+                    try:
+                        result = self.lark.send_card(event.chat_id, done_card)
+                        msg_id = first_field(result, "message_id")
+                        if msg_id:
+                            self.outbox.remember_message_id(event.chat_id, str(msg_id), agent=agent, discussion_trigger=False)
+                    except LarkCLIError as exc:
+                        LOGGER.warning("follow-up card send failed: %s", exc)
+                    if self.settings.enable_memory:
+                        self.memory.append_assistant(event.chat_id, agent, text)
+                    if self.should_enqueue_teammate_handoff(route, text, depth):
+                        self.enqueue_teammate_handoff(
+                            event, source_agent=agent, reply=text,
+                            inbound_source_agent=source_agent, handoff_depth=depth,
+                        )
                 else:
                     self.send_bridge_markdown(
                         event.chat_id, text, agent=agent, discussion_trigger=False,

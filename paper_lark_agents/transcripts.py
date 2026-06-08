@@ -132,10 +132,14 @@ def claude_followup_from_lines(lines: list[dict]) -> TurnResult | None:
     last = messages[-1]
     dispatched = _dispatches_task_subagent(messages)
     if last.get("stop_reason") not in CLAUDE_TERMINAL_STOP_REASONS and not dispatched:
+        # Not terminal, but if there is substantive text (e.g. a progress
+        # report before a /loop timer tool_use), deliver it anyway.
+        text = "\n\n".join(t for m in messages if (t := _claude_message_text(m))).strip()
+        if text and len(text) > 20:
+            usage = last.get("usage") if isinstance(last.get("usage"), dict) else None
+            return TurnResult(text=text, usage=usage)
         return None
     if dispatched:
-        # A follow-up stage can itself narrate then launch another subagent;
-        # deliver that narration as its own stage (don't wait for the result).
         text = "\n\n".join(t for m in messages if (t := _claude_message_text(m))).strip()
     else:
         text = _claude_message_text(last)

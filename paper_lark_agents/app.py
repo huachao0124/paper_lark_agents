@@ -1921,9 +1921,6 @@ class PaperAgentBridge:
         """Persistent loop that polls all registered transcript cursors for
         follow-up replies (e.g. subagent results after the first end_turn)."""
         sent: dict[str, set[str]] = {}  # key -> set of sent text signatures
-        # Track running cards for follow-ups so we show progress while a
-        # subagent is working, not just a sudden "done" card.
-        followup_cards: dict[str, TurnCard] = {}
         while not stop_event.is_set():
             stop_event.wait(3)
             with self._followup_lock:
@@ -1934,7 +1931,6 @@ class PaperAgentBridge:
                 # transcript reading to avoid both paths sending the same reply.
                 if self._active_run_ids:
                     continue
-                agent = key.split(":", 1)[0]
                 try:
                     text, new_cur = self.agents.claude_session.poll_followup_reply(path, cur, timeout=0)
                 except Exception:
@@ -1946,77 +1942,33 @@ class PaperAgentBridge:
                     if key in self._followup_cursors:
                         old = self._followup_cursors[key]
                         self._followup_cursors[key] = (old[0], new_cur, *old[2:])
-                # No completed reply yet — if there is transcript activity,
-                # create or update a "running" card so the user sees progress
-                # while the subagent works.
-                if text is None:
-                    if new_cur != cur and self.settings.send_progress:
-                        if key not in followup_cards:
-                            card = self.start_turn_card(
-                                event.chat_id, agent,
-                                self.chat_model_label(event.chat_id, agent),
-                                self.chat_effort_label(event.chat_id, agent),
-                                force=True,
-                            )
-                            if card:
-                                followup_cards[key] = card
-                        card = followup_cards.get(key)
-                        if card:
-                            from .transcripts import activity_detail, read_new_jsonl
-                            try:
-                                peek_lines, _ = read_new_jsonl(Path(path), cur)
-                            except Exception:
-                                peek_lines = []
-                            detail = activity_detail(peek_lines, agent) if peek_lines else "🤝 子代理工作中…"
-                            self._render_turn_card(card, "running", detail or "🤝 子代理工作中…")
-                    continue
-                if self.is_no_reply(text):
-                    followup_cards.pop(key, None)
+                if text is None or self.is_no_reply(text):
                     continue
                 sig = text[:200]
                 key_sent = sent.setdefault(key, set())
                 if sig in key_sent:
-                    followup_cards.pop(key, None)
                     continue
                 if self.settings.enable_memory:
                     recent = self.memory.context(event.chat_id)
                     if sig in recent:
                         key_sent.add(sig)
-                        followup_cards.pop(key, None)
                         continue
                 key_sent.add(sig)
+                agent = key.split(":", 1)[0]
                 LOGGER.info("follow-up reply from %s in %s", agent, event.chat_id)
-                # If we already have a running card for this follow-up, reuse it
-                # and finalize it. Otherwise create a new one.
-                card = followup_cards.pop(key, None)
-                if card:
-                    self.finalize_turn_reply(
-                        card, route, event, text,
-                        source_agent=source_agent, handoff_depth=depth,
-                    )
-                elif self.settings.send_progress:
+                card = None
+                if self.settings.send_progress:
                     card = self.start_turn_card(
                         event.chat_id, agent,
                         self.chat_model_label(event.chat_id, agent),
                         self.chat_effort_label(event.chat_id, agent),
                         force=True,
                     )
-                    if card:
-                        self.finalize_turn_reply(
-                            card, route, event, text,
-                            source_agent=source_agent, handoff_depth=depth,
-                        )
-                    else:
-                        self.send_bridge_markdown(
-                            event.chat_id, text, agent=agent, discussion_trigger=False,
-                        )
-                        if self.settings.enable_memory:
-                            self.memory.append_assistant(event.chat_id, agent, text)
-                        if self.should_enqueue_teammate_handoff(route, text, depth):
-                            self.enqueue_teammate_handoff(
-                                event, source_agent=agent, reply=text,
-                                inbound_source_agent=source_agent, handoff_depth=depth,
-                            )
+                if card:
+                    self.finalize_turn_reply(
+                        card, route, event, text,
+                        source_agent=source_agent, handoff_depth=depth,
+                    )
                 else:
                     self.send_bridge_markdown(
                         event.chat_id, text, agent=agent, discussion_trigger=False,

@@ -404,16 +404,16 @@ class LarkSDK:
                 self.settings.lark_encrypt_key or "", ""
             )
             .register_p2_im_message_receive_v1(
-                lambda ctx, data: self._dispatch_im_event(data, "im.message.receive_v1", on_event)
+                lambda data: self._dispatch_im_event(data, "im.message.receive_v1", on_event)
             )
             .register_p2_im_chat_member_bot_added_v1(
-                lambda ctx, data: self._dispatch_lifecycle_event(data, "im.chat.member.bot.added_v1", on_event)
+                lambda data: self._dispatch_lifecycle_event(data, "im.chat.member.bot.added_v1", on_event)
             )
             .register_p2_im_chat_member_bot_deleted_v1(
-                lambda ctx, data: self._dispatch_lifecycle_event(data, "im.chat.member.bot.deleted_v1", on_event)
+                lambda data: self._dispatch_lifecycle_event(data, "im.chat.member.bot.deleted_v1", on_event)
             )
             .register_p2_im_chat_disbanded_v1(
-                lambda ctx, data: self._dispatch_lifecycle_event(data, "im.chat.disbanded_v1", on_event)
+                lambda data: self._dispatch_lifecycle_event(data, "im.chat.disbanded_v1", on_event)
             )
             .build()
         )

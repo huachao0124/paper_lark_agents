@@ -191,6 +191,181 @@ class LarkSDK:
         )
         return self._msg_response_dict(response)
 
+    # ---- streaming cards (CardKit) ----
+
+    def create_streaming_card(
+        self,
+        title: str,
+        initial_content: str = "",
+        element_id: str = "streaming_md",
+    ) -> str:
+        from lark_oapi.api.cardkit.v1 import (
+            CreateCardRequest,
+            CreateCardRequestBody,
+        )
+        card_json = json.dumps({
+            "schema": "2.0",
+            "header": {
+                "title": {"content": title, "tag": "plain_text"},
+                "template": "blue",
+            },
+            "config": {
+                "streaming_mode": True,
+                "summary": {"content": "[生成中...]"},
+                "streaming_config": {
+                    "print_frequency_ms": {"default": 50},
+                    "print_step": {"default": 2},
+                    "print_strategy": "fast",
+                },
+            },
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": initial_content or "✻ 思考中…",
+                        "element_id": element_id,
+                    }
+                ]
+            },
+        }, ensure_ascii=False)
+        body = (
+            CreateCardRequestBody.builder()
+            .type("card_json")
+            .data(card_json)
+            .build()
+        )
+        request = CreateCardRequest.builder().request_body(body).build()
+        response = self._request_with_retry(
+            lambda r=request: self._client.cardkit.v1.card.create(r)
+        )
+        return response.data.card_id
+
+    def send_streaming_card(self, chat_id: str, card_id: str) -> str:
+        content = json.dumps(
+            {"type": "card", "data": {"card_id": card_id}},
+            ensure_ascii=False,
+        )
+        body = (
+            CreateMessageRequestBody.builder()
+            .receive_id(chat_id)
+            .msg_type("interactive")
+            .content(content)
+            .build()
+        )
+        request = (
+            CreateMessageRequest.builder()
+            .receive_id_type("chat_id")
+            .request_body(body)
+            .build()
+        )
+        response = self._request_with_retry(
+            lambda r=request: self._client.im.v1.message.create(r)
+        )
+        return getattr(response.data, "message_id", "") or ""
+
+    def stream_card_content(
+        self,
+        card_id: str,
+        content: str,
+        element_id: str = "streaming_md",
+        sequence: int = 1,
+    ) -> None:
+        request = (
+            lark.BaseRequest.builder()
+            .http_method(lark.HttpMethod.PUT)
+            .uri(f"/open-apis/cardkit/v1/cards/{card_id}/elements/{element_id}/content")
+            .token_types({lark.AccessTokenType.TENANT})
+            .body({"content": content, "sequence": sequence})
+            .build()
+        )
+        response = self._client.request(request)
+        if response.code != 0:
+            LOGGER.warning("stream_card_content failed: %s %s", response.code, response.msg)
+
+    def finalize_streaming_card(
+        self,
+        card_id: str,
+        final_content: str | None = None,
+        title: str | None = None,
+        template: str = "green",
+        sequence: int = 1,
+        footer: str | None = None,
+    ) -> None:
+        if final_content is not None:
+            self.stream_card_content(card_id, final_content, sequence=sequence)
+            sequence += 1
+        # Disable streaming mode
+        request = (
+            lark.BaseRequest.builder()
+            .http_method(lark.HttpMethod.PATCH)
+            .uri(f"/open-apis/cardkit/v1/cards/{card_id}/settings")
+            .token_types({lark.AccessTokenType.TENANT})
+            .body({
+                "settings": json.dumps({"config": {"streaming_mode": False}}, ensure_ascii=False),
+                "sequence": sequence,
+            })
+            .build()
+        )
+        response = self._client.request(request)
+        if response.code != 0:
+            LOGGER.warning("finalize_streaming_card settings failed: %s %s", response.code, response.msg)
+        sequence += 1
+        # Update header (title + color) via card update API
+        if title:
+            elements = [{"tag": "markdown", "content": final_content or "", "element_id": "streaming_md"}]
+            if footer:
+                elements.append({"tag": "hr"})
+                elements.append({"tag": "markdown", "content": f"_{footer}_", "element_id": "footer_md"})
+            request = (
+                lark.BaseRequest.builder()
+                .http_method(lark.HttpMethod.PUT)
+                .uri(f"/open-apis/cardkit/v1/cards/{card_id}")
+                .token_types({lark.AccessTokenType.TENANT})
+                .body({
+                    "card": {
+                        "type": "card_json",
+                        "data": json.dumps({
+                            "schema": "2.0",
+                            "header": {
+                                "title": {"content": title, "tag": "plain_text"},
+                                "template": template,
+                            },
+                            "body": {"elements": elements},
+                        }, ensure_ascii=False),
+                    },
+                    "sequence": sequence,
+                })
+                .build()
+            )
+            response = self._client.request(request)
+            if response.code != 0:
+                LOGGER.warning("finalize_streaming_card update failed: %s %s", response.code, response.msg)
+        elif footer:
+            self._append_card_element(card_id, footer, sequence=sequence)
+
+    def _append_card_element(
+        self, card_id: str, footer_text: str, sequence: int = 1,
+    ) -> None:
+        elements = json.dumps([
+            {"tag": "hr"},
+            {"tag": "markdown", "content": f"_{footer_text}_", "element_id": "footer_md"},
+        ], ensure_ascii=False)
+        request = (
+            lark.BaseRequest.builder()
+            .http_method(lark.HttpMethod.POST)
+            .uri(f"/open-apis/cardkit/v1/cards/{card_id}/elements")
+            .token_types({lark.AccessTokenType.TENANT})
+            .body({
+                "type": "append",
+                "elements": elements,
+                "sequence": sequence,
+            })
+            .build()
+        )
+        response = self._client.request(request)
+        if response.code != 0:
+            LOGGER.warning("_append_card_element failed: %s %s", response.code, response.msg)
+
     def update_card(self, message_id: str, card: dict[str, Any]) -> dict[str, Any]:
         content = json.dumps(card, ensure_ascii=False, separators=(",", ":"))
         body = PatchMessageRequestBody.builder().content(content).build()

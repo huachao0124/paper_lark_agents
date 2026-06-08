@@ -189,6 +189,8 @@ class TurnCard:
     model: str
     effort: str
     started_at: float
+    card_id: str | None = None
+    sequence: int = 0
 
 
 class PaperAgentBridge:
@@ -1771,23 +1773,34 @@ class PaperAgentBridge:
             summary = summary[:497].rstrip() + "..."
         status.update(state, summary)
 
+    def _supports_streaming_cards(self) -> bool:
+        return hasattr(self.lark, "create_streaming_card")
+
     def start_turn_card(
         self, chat_id: str, agent: str, model: str, effort: str, *, force: bool = False,
     ) -> TurnCard | None:
-        # One card per (agent, chat). The entire check→create→register sequence
-        # is under a lock so concurrent event threads don't race.
         card_key = f"{agent}:{chat_id}"
         with self._turn_card_lock:
             old = self._active_turn_cards.get(card_key)
             if old:
                 if not force:
                     return None
-                # Only overwrite if the old card is still running (not yet
-                # finalized). If finalize already rendered it as done/skipped,
-                # just remove the stale entry and create a fresh card.
                 self._active_turn_cards.pop(card_key, None)
             agent_name = self.agent_display_name(agent)
             started_at = time.time()
+            if self._supports_streaming_cards():
+                try:
+                    card_id = self.lark.create_streaming_card(f"{agent_name} · Running")
+                    message_id = self.lark.send_streaming_card(chat_id, card_id)
+                except LarkCLIError as exc:
+                    LOGGER.warning("streaming card send failed: %s", exc)
+                    return None
+                if not message_id:
+                    return None
+                self.outbox.remember_message_id(chat_id, message_id, agent=agent, discussion_trigger=False)
+                turn_card = TurnCard(message_id, chat_id, agent, agent_name, model, effort, started_at, card_id=card_id, sequence=0)
+                self._active_turn_cards[card_key] = turn_card
+                return turn_card
             card = turn_reply_card(agent_name, "running", "✻ 思考中", model=model, effort=effort, started_at=started_at)
             try:
                 result = self.lark.send_card(chat_id, card)
@@ -1803,16 +1816,47 @@ class PaperAgentBridge:
             return turn_card
 
     def _render_turn_card(self, card: TurnCard, state: str, body: str) -> bool:
+        if card.card_id and self._supports_streaming_cards():
+            try:
+                if state == "running":
+                    card.sequence += 1
+                    self.lark.stream_card_content(card.card_id, body, sequence=card.sequence)
+                else:
+                    footer = self._turn_card_footer(card)
+                    card.sequence += 1
+                    template = {"done": "green", "failed": "red", "skipped": "grey"}.get(state, "blue")
+                    title = f"{card.agent_name} · {state.title()}"
+                    self.lark.finalize_streaming_card(
+                        card.card_id,
+                        final_content=body,
+                        title=title,
+                        template=template,
+                        sequence=card.sequence,
+                        footer=footer,
+                    )
+            except LarkCLIError as exc:
+                LOGGER.warning("streaming card update failed for %s: %s", card.card_id, exc)
+                return False
+            return True
         rendered = turn_reply_card(
             card.agent_name, state, body, model=card.model, effort=card.effort, started_at=card.started_at
         )
         try:
-            # Patch under this agent's own identity — the same one that sent it.
             self.lark.update_card(card.message_id, rendered)
         except LarkCLIError as exc:
             LOGGER.warning("turn card update failed for %s: %s", card.message_id, exc)
             return False
         return True
+
+    def _turn_card_footer(self, card: TurnCard) -> str:
+        elapsed = max(0, int(time.time() - card.started_at))
+        parts = []
+        if card.model:
+            parts.append(card.model)
+        if card.effort:
+            parts.append(card.effort)
+        parts.append(f"{elapsed}s")
+        return " · ".join(parts)
 
     def register_followup_cursor(
         self,

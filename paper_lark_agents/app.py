@@ -481,12 +481,6 @@ class PaperAgentBridge:
             handoff.target_agent,
             handoff.chat_id,
         )
-        self.send_bridge_markdown(
-            handoff.chat_id,
-            handoff.content,
-            agent=handoff.source_agent,
-            discussion_trigger=False,
-        )
         if self.settings.enable_memory:
             self.memory.append_assistant(handoff.chat_id, handoff.source_agent, handoff.content)
         reply = self.dispatch(

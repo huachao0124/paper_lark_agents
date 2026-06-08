@@ -196,7 +196,7 @@ class AppHandoffTests(unittest.TestCase):
             claude.process_pending_handoffs("claude")
 
             self.assertIn("source: assistant:codex", fake_agents.claude_prompts[0])
-            self.assertEqual(fake_lark.markdowns, [("oc_a", "Codex answer"), ("oc_a", "Claude follow-up")])
+            self.assertEqual(fake_lark.markdowns, [("oc_a", "Claude follow-up")])
             self.assertEqual(claude.handoffs.pending_for("claude"), [])
             self.assertEqual(claude.handoffs.pending_for("codex"), [])
 

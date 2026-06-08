@@ -1660,6 +1660,18 @@ def session_tail_busy(text: str) -> bool:
     )
 
 
+def session_has_background_work(text: str) -> bool:
+    return bool(
+        re.search(
+            r"Waiting for \d+ background agent"
+            r"|esc to interrupt"
+            r"|Bootstrapping"
+            r"|↓ to manage",
+            text,
+        )
+    )
+
+
 def parse_session_model(text: str, agent: str) -> str | None:
     if agent == "codex":
         footer = re.compile(

@@ -1989,12 +1989,26 @@ class PaperAgentBridge:
             with self._followup_lock:
                 snapshot = dict(self._followup_cursors)
             dirty = False
-            # Finalize cards that have been idle for 30+ seconds.
+            # Finalize cards when the session is truly idle (no background
+            # agents, at prompt) — not on a fixed timeout.
             for key in list(followup_cards):
                 if key not in snapshot:
                     continue
                 idle_since = followup_idle.get(key, 0)
-                if idle_since and time.time() - idle_since > 30:
+                if not idle_since:
+                    continue
+                agent = key.split(":", 1)[0]
+                chat_id_for_key = snapshot[key][2].chat_id
+                session_idle = False
+                try:
+                    from .tmux_runtime import session_has_background_work
+                    runtime = self.agents.claude_session if agent == "claude" else self.agents.codex_session
+                    screen = runtime.capture(runtime.session_name(chat_id_for_key))
+                    session_idle = not session_has_background_work(screen)
+                except Exception:
+                    pass
+                if not session_idle and time.time() - idle_since < 600:
+                    continue
                     card_id, msg_id, seq, started_at = followup_cards.pop(key)
                     acc = followup_texts.pop(key, "")
                     followup_idle.pop(key, None)

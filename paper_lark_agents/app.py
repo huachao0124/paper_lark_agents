@@ -405,7 +405,7 @@ class PaperAgentBridge:
         return time.time() > run.created_at + max(1, timeout)
 
     def update_recovered_status(self, run: PendingRun, card: TurnCard | None) -> None:
-        if not card:
+        if not card or not card.message_id:
             return
         interval = max(1, self.settings.status_update_seconds)
         last = self._pending_status_updates.get(run.run_id, 0.0)
@@ -1861,6 +1861,8 @@ class PaperAgentBridge:
             self.lark.update_card(card.message_id, rendered)
         except LarkCLIError as exc:
             LOGGER.warning("turn card update failed for %s: %s", card.message_id, exc)
+            if "schemaV2" in str(exc) or "200830" in str(exc):
+                card.message_id = ""
             return False
         return True
 
@@ -2032,6 +2034,7 @@ class PaperAgentBridge:
                     try:
                         result = self.lark.send_card(event.chat_id, done_card)
                         msg_id = first_field(result, "message_id")
+                        LOGGER.info("follow-up card sent for %s in %s: %s", agent, event.chat_id, msg_id or "no msg_id")
                         if msg_id:
                             self.outbox.remember_message_id(event.chat_id, str(msg_id), agent=agent, discussion_trigger=False)
                     except LarkCLIError as exc:

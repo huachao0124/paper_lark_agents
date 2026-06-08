@@ -1979,18 +1979,47 @@ class PaperAgentBridge:
     def followup_loop(self, stop_event: threading.Event) -> None:
         """Persistent loop that polls all registered transcript cursors for
         follow-up replies (e.g. subagent results after the first end_turn)."""
-        sent: dict[str, set[str]] = {}  # key -> set of sent text signatures
+        sent: dict[str, set[str]] = {}
+        # One streaming card per key — all follow-ups append to the same card.
+        followup_cards: dict[str, tuple[str, str, int, float]] = {}  # key -> (card_id, msg_id, sequence, started_at)
+        followup_texts: dict[str, str] = {}  # key -> accumulated text
+        followup_idle: dict[str, float] = {}  # key -> last activity time
         while not stop_event.is_set():
             stop_event.wait(3)
             with self._followup_lock:
                 snapshot = dict(self._followup_cursors)
             dirty = False
+            # Finalize cards that have been idle for 30+ seconds.
+            for key in list(followup_cards):
+                if key not in snapshot:
+                    continue
+                idle_since = followup_idle.get(key, 0)
+                if idle_since and time.time() - idle_since > 30:
+                    card_id, msg_id, seq, started_at = followup_cards.pop(key)
+                    acc = followup_texts.pop(key, "")
+                    followup_idle.pop(key, None)
+                    agent = key.split(":", 1)[0]
+                    if self._supports_streaming_cards() and card_id:
+                        footer = self._turn_card_footer(TurnCard(
+                            msg_id, "", agent, self.agent_display_name(agent),
+                            self.chat_model_label(snapshot[key][2].chat_id, agent),
+                            self.chat_effort_label(snapshot[key][2].chat_id, agent),
+                            started_at,
+                        ))
+                        try:
+                            self.lark.finalize_streaming_card(
+                                card_id, final_content=acc,
+                                title=f"{self.agent_display_name(agent)} · Done",
+                                sequence=seq + 1, footer=footer,
+                            )
+                        except LarkCLIError:
+                            pass
+                    LOGGER.info("follow-up card finalized for %s", key)
             for key, (path, cur, event, route, source_agent, depth) in snapshot.items():
                 try:
                     text, new_cur = self.agents.claude_session.poll_followup_reply(path, cur, timeout=0)
                 except Exception:
                     continue
-                # Update cursor even if no result (advances past consumed lines).
                 if new_cur != cur:
                     dirty = True
                 with self._followup_lock:
@@ -2011,30 +2040,31 @@ class PaperAgentBridge:
                 key_sent.add(sig)
                 agent = key.split(":", 1)[0]
                 LOGGER.info("follow-up reply from %s in %s", agent, event.chat_id)
-                # Follow-up replies are already complete — use a plain card
-                # (not streaming) to avoid sequence issues from rapid create+finalize.
-                if self.settings.send_progress:
-                    agent_name = self.agent_display_name(agent)
-                    footer = self._turn_card_footer(TurnCard(
-                        "", event.chat_id, agent, agent_name,
-                        self.chat_model_label(event.chat_id, agent),
-                        self.chat_effort_label(event.chat_id, agent),
-                        time.time(),
-                    ))
-                    done_card = turn_reply_card(
-                        agent_name, "done", text[:self.settings.max_message_chars],
-                        model=self.chat_model_label(event.chat_id, agent),
-                        effort=self.chat_effort_label(event.chat_id, agent),
-                        started_at=time.time(),
-                    )
-                    try:
-                        result = self.lark.send_card(event.chat_id, done_card)
-                        msg_id = first_field(result, "message_id")
-                        LOGGER.info("follow-up card sent for %s in %s: %s", agent, event.chat_id, msg_id or "no msg_id")
-                        if msg_id:
-                            self.outbox.remember_message_id(event.chat_id, str(msg_id), agent=agent, discussion_trigger=False)
-                    except LarkCLIError as exc:
-                        LOGGER.warning("follow-up card send failed: %s", exc)
+                followup_idle[key] = time.time()
+                if self.settings.send_progress and self._supports_streaming_cards():
+                    if key not in followup_cards:
+                        try:
+                            agent_name = self.agent_display_name(agent)
+                            card_id = self.lark.create_streaming_card(f"{agent_name} · Running")
+                            msg_id = self.lark.send_streaming_card(event.chat_id, card_id)
+                            followup_cards[key] = (card_id, msg_id, 0, time.time())
+                            followup_texts[key] = ""
+                            self.outbox.remember_message_id(event.chat_id, msg_id, agent=agent, discussion_trigger=False)
+                        except LarkCLIError as exc:
+                            LOGGER.warning("follow-up streaming card create failed: %s", exc)
+                    if key in followup_cards:
+                        card_id, msg_id, seq, started_at = followup_cards[key]
+                        acc = followup_texts.get(key, "")
+                        if acc:
+                            acc += "\n\n---\n\n"
+                        acc += text
+                        followup_texts[key] = acc
+                        seq += 1
+                        followup_cards[key] = (card_id, msg_id, seq, started_at)
+                        try:
+                            self.lark.stream_card_content(card_id, acc[:self.settings.max_message_chars], sequence=seq)
+                        except LarkCLIError:
+                            pass
                     if self.settings.enable_memory:
                         self.memory.append_assistant(event.chat_id, agent, text)
                     if self.should_enqueue_teammate_handoff(route, text, depth):

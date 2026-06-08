@@ -1788,6 +1788,16 @@ class PaperAgentBridge:
             if old:
                 if not force:
                     return None
+                if old.card_id and self._supports_streaming_cards():
+                    try:
+                        self.lark.finalize_streaming_card(
+                            old.card_id,
+                            title=f"{old.agent_name} · Interrupted",
+                            template="grey",
+                            sequence=old.sequence + 1,
+                        )
+                    except Exception:
+                        pass
                 self._active_turn_cards.pop(card_key, None)
             agent_name = self.agent_display_name(agent)
             started_at = time.time()

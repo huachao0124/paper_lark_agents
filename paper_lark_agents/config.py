@@ -139,6 +139,9 @@ def proxy_command_prefix(proxy_url: str | None, no_proxy: str | None) -> list[st
 class Settings:
     lark_cli: str
     lark_profile: str | None
+    lark_app_id: str | None
+    lark_app_secret: str | None
+    lark_encrypt_key: str | None
     dashboard_lark_profile: str | None
     event_key: str
     event_keys: tuple[str, ...]
@@ -226,6 +229,9 @@ def load_settings(env_file: str | None = ".env") -> Settings:
     return Settings(
         lark_cli=_env("PLA_LARK_CLI", "lark-cli"),
         lark_profile=_optional("PLA_LARK_PROFILE"),
+        lark_app_id=_optional("PLA_LARK_APP_ID"),
+        lark_app_secret=_optional("PLA_LARK_APP_SECRET"),
+        lark_encrypt_key=_optional("PLA_LARK_ENCRYPT_KEY"),
         dashboard_lark_profile=_optional("PLA_DASHBOARD_LARK_PROFILE"),
         event_key=event_key,
         event_keys=_csv("PLA_EVENT_KEYS", event_key),

@@ -630,6 +630,13 @@ def first_field(data: Any, field: str) -> Any:
     return None
 
 
+def create_lark_client(settings: "Settings") -> "LarkCLI":
+    if settings.lark_app_id and settings.lark_app_secret:
+        from .lark_sdk import LarkSDK
+        return LarkSDK(settings)  # type: ignore[return-value]
+    return LarkCLI(settings)
+
+
 def first_download_path(data: Any) -> str | None:
     for field in ("local_path", "path", "file_path", "output", "filename", "file"):
         value = first_field(data, field)

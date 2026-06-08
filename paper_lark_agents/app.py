@@ -23,7 +23,7 @@ from .inbound_files import (
     post_text_without_resources,
 )
 from .handoff import AgentHandoff, AgentHandoffQueue
-from .lark_cli import LarkCLI, LarkCLIError, LarkEvent, MessageEvent, first_field
+from .lark_cli import LarkCLI, LarkCLIError, LarkEvent, MessageEvent, create_lark_client, first_field
 from .memory import ChatMemory
 from .models import ChatModelStore, ModelError, normalize_model
 from .outbox import AssistantOutbox
@@ -194,9 +194,9 @@ class TurnCard:
 class PaperAgentBridge:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.lark = LarkCLI(settings)
+        self.lark = create_lark_client(settings)
         self._dashboard_lark = (
-            LarkCLI(replace(settings, lark_profile=settings.dashboard_lark_profile))
+            create_lark_client(replace(settings, lark_profile=settings.dashboard_lark_profile))
             if settings.dashboard_lark_profile
             else None
         )

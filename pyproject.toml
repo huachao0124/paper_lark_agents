@@ -3,7 +3,7 @@ name = "paper-lark-agents"
 version = "0.1.0"
 description = "Bridge Feishu group messages to Codex, Claude Code, and Feishu Tasks."
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["lark-oapi>=1.6.8"]
 
 [project.scripts]
 paper-lark-agents = "paper_lark_agents.cli:main"

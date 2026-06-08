@@ -1849,7 +1849,10 @@ class PaperAgentBridge:
                     )
             except LarkCLIError as exc:
                 LOGGER.warning("streaming card update failed for %s: %s", card.card_id, exc)
-                return False
+                # Streaming mode may have auto-closed (10 min timeout) or
+                # sequence diverged. Fall back to regular card update.
+                card.card_id = None
+                return self._render_turn_card(card, state, body)
             return True
         rendered = turn_reply_card(
             card.agent_name, state, body, model=card.model, effort=card.effort, started_at=card.started_at

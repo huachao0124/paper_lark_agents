@@ -123,6 +123,14 @@ def route_message(
     # and /both — but still allow /debate, /task, and respond_to_all (each
     # process uses its own default_agent so there is no cross-instance conflict).
     if strict_alias and alias_remainder is None:
+        for prefix in ("/both", "!both", "@both"):
+            remainder = _strip_prefix(text, lowered, prefix)
+            if remainder is not None and remainder:
+                return Route(
+                    "multi_agent",
+                    text=remainder,
+                    agent_texts={agent: remainder for agent in enabled_order},
+                )
         for prefix in ("/debate", "!debate", "debate:"):
             remainder = _strip_prefix(command_text, command_lowered, prefix)
             if remainder is not None:

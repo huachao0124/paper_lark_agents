@@ -280,7 +280,7 @@ class LarkSDK:
         )
         response = self._client.request(request)
         if response.code != 0:
-            LOGGER.warning("stream_card_content failed: %s %s", response.code, response.msg)
+            raise LarkCLIError(f"stream_card_content: {response.code} {response.msg}")
 
     def finalize_streaming_card(
         self,
@@ -308,9 +308,8 @@ class LarkSDK:
         )
         response = self._client.request(request)
         if response.code != 0:
-            LOGGER.warning("finalize_streaming_card settings failed: %s %s", response.code, response.msg)
+            raise LarkCLIError(f"finalize settings: {response.code} {response.msg}")
         sequence += 1
-        # Update header (title + color) via card update API
         if title:
             elements = [{"tag": "markdown", "content": final_content or "", "element_id": "streaming_md"}]
             if footer:
@@ -339,7 +338,7 @@ class LarkSDK:
             )
             response = self._client.request(request)
             if response.code != 0:
-                LOGGER.warning("finalize_streaming_card update failed: %s %s", response.code, response.msg)
+                raise LarkCLIError(f"finalize update: {response.code} {response.msg}")
         elif footer:
             self._append_card_element(card_id, footer, sequence=sequence)
 

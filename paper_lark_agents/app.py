@@ -322,6 +322,7 @@ class PaperAgentBridge:
             run.model_label or self.chat_model_label(run.chat_id, run.agent),
             run.effort_label or self.chat_effort_label(run.chat_id, run.agent),
             run.created_at,
+            card_id=run.card_id,
         )
 
     def process_pending_run(self, run: PendingRun) -> None:
@@ -876,6 +877,7 @@ class PaperAgentBridge:
                     session_name=self.agents.session_name(route.agent, event.chat_id),
                     workspace=str(workspace),
                     status_message_id=turn_card.message_id if turn_card else None,
+                    card_id=turn_card.card_id if turn_card else None,
                     model_label=self.chat_model_label(event.chat_id, route.agent),
                     effort_label=self.chat_effort_label(event.chat_id, route.agent),
                     timeout=self.agent_timeout(route.agent),
@@ -1084,6 +1086,7 @@ class PaperAgentBridge:
             start_marker=start_marker, end_marker=end_marker,
             session_name=session_name, workspace=str(workspace),
             status_message_id=turn_card.message_id if turn_card else None,
+            card_id=turn_card.card_id if turn_card else None,
             model_label=self.chat_model_label(chat_id, agent),
             effort_label=self.chat_effort_label(chat_id, agent),
             timeout=self.agent_timeout(agent),

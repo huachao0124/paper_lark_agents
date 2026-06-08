@@ -30,6 +30,7 @@ class PendingRun:
     session_name: str
     workspace: str
     status_message_id: str | None
+    card_id: str | None
     model_label: str
     effort_label: str
     timeout: int
@@ -207,6 +208,7 @@ def record_to_pending_run(record: dict[str, Any]) -> PendingRun:
         session_name=str(record.get("session_name") or ""),
         workspace=str(record.get("workspace") or ""),
         status_message_id=str(record.get("status_message_id") or "") or None,
+        card_id=str(record.get("card_id") or "") or None,
         model_label=str(record.get("model_label") or ""),
         effort_label=str(record.get("effort_label") or ""),
         timeout=int(record.get("timeout") or 0),

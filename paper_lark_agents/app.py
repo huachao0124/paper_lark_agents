@@ -1525,10 +1525,7 @@ class PaperAgentBridge:
         """
         if not self.wants_room_recap(agent, chat_id, source_agent):
             return ""
-        # Exclude the receiving agent's own turns from the recap — they already
-        # exist in its CLI session, so re-sending them just wastes tokens. Only
-        # the peer's and the human's turns are this agent's real blind spot.
-        recap = self.memory.context(chat_id, exclude_agent=agent).rstrip()
+        recap = self.memory.unseen_context(chat_id, agent).rstrip()
         if not recap or recap.startswith("No previous discussion"):
             return ""
         # On a peer handoff the peer's message is delivered separately as the

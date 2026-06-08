@@ -90,9 +90,6 @@ class ChatMemory:
             if not content:
                 continue
             if role == "assistant":
-                # Skip the receiving agent's own turns: they already exist in
-                # its CLI session, so re-sending them in a handoff recap is
-                # redundant. Peer + human turns are its actual blind spot.
                 if exclude_agent and entry.get("agent") == exclude_agent:
                     continue
                 name = str(entry.get("agent") or "assistant")
@@ -100,6 +97,41 @@ class ChatMemory:
                 name = str(entry.get("sender_id") or "user")
             lines.append(f"{name}: {content}")
 
+        text = "\n\n".join(lines)
+        if len(text) <= self.max_chars:
+            return text
+        return text[-self.max_chars :]
+
+    def unseen_context(self, chat_id: str, agent: str) -> str:
+        """Return only messages that happened AFTER this agent's last turn.
+
+        Unlike context(), this avoids re-sending content the agent already
+        received in its CLI session (via handoff prompts or respond_to_all).
+        """
+        entries = self._read(chat_id)[-self.max_turns :]
+        if not entries:
+            return ""
+        last_own_idx = -1
+        for idx in range(len(entries) - 1, -1, -1):
+            if entries[idx].get("role") == "assistant" and entries[idx].get("agent") == agent:
+                last_own_idx = idx
+                break
+        after = entries[last_own_idx + 1:] if last_own_idx >= 0 else entries
+        lines: list[str] = []
+        for entry in after:
+            content = str(entry.get("content") or "").strip()
+            if not content:
+                continue
+            role = str(entry.get("role") or "unknown")
+            if role == "assistant":
+                if entry.get("agent") == agent:
+                    continue
+                name = str(entry.get("agent") or "assistant")
+            else:
+                name = str(entry.get("sender_id") or "user")
+            lines.append(f"{name}: {content}")
+        if not lines:
+            return ""
         text = "\n\n".join(lines)
         if len(text) <= self.max_chars:
             return text

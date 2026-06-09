@@ -213,6 +213,7 @@ class PaperAgentBridge:
         self._active_run_ids: set[str] = set()
         self.cards = TurnCardManager(self.lark, self.settings)
         self._recent_handoff_sigs: set[str] = set()
+        self._delivered_sigs: set[str] = set()
         # Follow-up poller state: per (agent, chat_id), the transcript cursor
         # to watch for additional end_turn messages after the first reply.
         self._followup_cursors: dict[str, tuple[str, int, MessageEvent, Route, str | None, int]] = {}
@@ -1989,6 +1990,8 @@ class PaperAgentBridge:
                 if text is None or self.is_no_reply(text):
                     continue
                 sig = text[:200]
+                if sig in self._delivered_sigs:
+                    continue
                 key_sent = sent.setdefault(key, set())
                 if sig in key_sent:
                     continue
@@ -2047,6 +2050,9 @@ class PaperAgentBridge:
         if self.is_no_reply(text):
             self.cards.finalize(card, "skipped", "—")
             return
+        self._delivered_sigs.add(text[:200])
+        if len(self._delivered_sigs) > 200:
+            self._delivered_sigs = set(list(self._delivered_sigs)[-100:])
         limit = self.settings.max_message_chars
         head = text if len(text) <= limit else text[:limit].rstrip() + "\n\n…（下接）"
         if not self.cards.finalize(card, "done", head):

@@ -205,6 +205,7 @@ class TurnCardManager:
 
     def _update_plain(self, card: TurnCard, detail: str) -> None:
         if not card.message_id:
+            LOGGER.debug("skip plain update: no message_id")
             return
         rendered = turn_reply_card(
             card.agent_name, "running", detail,
@@ -245,7 +246,8 @@ class TurnCardManager:
                 card.message_id = new_msg_id
                 card.sequence = 1
                 card.started_at = time.time()
-                self._accumulated.pop(card.card_id, None) if card.card_id else None
+                if card.card_id:
+                    self._accumulated.pop(card.card_id, None)
             self._lark.stream_card_content(new_card_id, detail, sequence=1)
             return True
         except Exception:

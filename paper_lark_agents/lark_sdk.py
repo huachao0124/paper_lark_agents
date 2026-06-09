@@ -661,7 +661,7 @@ class LarkSDK:
     # ---- internals ----
 
     def _request_with_retry(self, call: Callable, retries: int = 3) -> Any:
-        import time as _time
+        import time as _time  # noqa: module-level time shadows lark_oapi.time
         last_err = ""
         for attempt in range(retries):
             response = call()

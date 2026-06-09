@@ -112,6 +112,14 @@ class TurnCardManager:
                 LOGGER.warning("streaming update failed for %s: %s", card_id, exc)
                 if not self._renew_streaming_card(card, detail, seq):
                     self._downgrade_to_plain(card)
+                    new = self._create_card(
+                        card.chat_id, card.agent, card.agent_name,
+                        card.model, card.effort, "plain",
+                    )
+                    if new:
+                        with self._lock:
+                            card.message_id = new.message_id
+                        return
         self._update_plain(card, detail)
 
     def finalize(self, card: TurnCard, state: str, body: str) -> bool:
@@ -254,9 +262,12 @@ class TurnCardManager:
             return False
 
     def _downgrade_to_plain(self, card: TurnCard) -> None:
+        old_msg = card.message_id
         with self._lock:
             card.strategy = "plain"
             card.card_id = None
+            card.message_id = ""
+        self._delete_message(old_msg)
 
     def _interrupt_card(self, card: TurnCard) -> None:
         if card.card_id and card.strategy == "streaming":

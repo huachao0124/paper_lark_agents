@@ -172,24 +172,26 @@ class AgentRunner:
         workspace: Path | None = None,
         model: str | None = None,
         effort: str | None = None,
-    ) -> str | None:
+    ) -> tuple[str | None, bool]:
+        """Returns (session_name, needs_init). needs_init is True when the
+        session was freshly created and has not received its context prompt."""
         if agent == "codex":
             if self.settings.codex_runtime != "session":
-                return None
+                return None, False
             runtime = self.codex_session
         elif agent == "claude":
             if self.settings.claude_runtime != "session":
-                return None
+                return None, False
             runtime = self.claude_session
         else:
             raise AgentError(f"Unknown agent: {agent}")
         workspace = (workspace or self.settings.workspace).expanduser().resolve()
         session_name = runtime.session_name(chat_id)
         try:
-            runtime.ensure_session(session_name, chat_id, workspace, model, effort)
+            needs_init = runtime.ensure_session(session_name, chat_id, workspace, model, effort)
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
             raise AgentError(str(exc)) from exc
-        return session_name
+        return session_name, needs_init
 
     def session_name(self, agent: str, chat_id: str) -> str:
         if agent == "codex":

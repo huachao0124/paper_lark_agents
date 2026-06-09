@@ -1411,7 +1411,7 @@ class PaperAgentBridge:
         status: StatusHandle | None = None,
     ) -> str:
         warmed: list[str] = []
-        warmed_agents: list[str] = []
+        needs_init_agents: list[str] = []
         failed: list[str] = []
         for agent in self.workspace_warmup_agents():
             if self.agent_runtime(agent) != "session":
@@ -1419,7 +1419,7 @@ class PaperAgentBridge:
             if status:
                 status.update("running", f"Starting {self.agent_display_name(agent)} session.")
             try:
-                session_name = self.agents.warmup_session(
+                session_name, needs_init = self.agents.warmup_session(
                     agent,
                     chat_id,
                     workspace=workspace,
@@ -1431,15 +1431,17 @@ class PaperAgentBridge:
                 failed.append(f"{self.agent_display_name(agent)}: {exc}")
                 continue
             if session_name:
-                warmed.append(f"{self.agent_display_name(agent)} (`{session_name}`)")
-                warmed_agents.append(agent)
-                LOGGER.info("warmed %s session for %s: %s", agent, chat_id, session_name)
+                label = "new" if needs_init else "resumed"
+                warmed.append(f"{self.agent_display_name(agent)} (`{session_name}`, {label})")
+                if needs_init:
+                    needs_init_agents.append(agent)
+                LOGGER.info("warmed %s session for %s: %s (%s)", agent, chat_id, session_name, label)
                 if status:
-                    status.update("running", f"{self.agent_display_name(agent)} session started.")
+                    status.update("running", f"{self.agent_display_name(agent)} session {label}.")
         init_done, init_pending = self.initialize_workspace_sessions(
             chat_id,
             workspace,
-            warmed_agents,
+            needs_init_agents,
             status,
         )
         if init_done:

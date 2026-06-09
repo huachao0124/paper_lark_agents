@@ -19,7 +19,7 @@ class FakeAgents:
 
     def warmup_session(self, agent, chat_id, workspace=None, model=None, effort=None):
         self.warmups.append((agent, chat_id, workspace, model, effort))
-        return f"pla-{agent}-{chat_id}"
+        return f"pla-{agent}-{chat_id}", True
 
     def send_session_command(
         self,

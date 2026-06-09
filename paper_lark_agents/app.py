@@ -1874,13 +1874,28 @@ class PaperAgentBridge:
             self._active_turn_cards[card_key] = turn_card
             return turn_card
 
+    _card_accumulated: dict[str, str] = {}
+
     def _render_turn_card(self, card: TurnCard, state: str, body: str) -> bool:
         if card.card_id and self._supports_streaming_cards():
             try:
                 if state == "running":
                     card.sequence += 1
-                    self.lark.stream_card_content(card.card_id, body, sequence=card.sequence)
+                    # Accumulate progress updates so earlier lines are not lost.
+                    acc_key = card.card_id
+                    prev = self._card_accumulated.get(acc_key, "")
+                    if prev and body not in prev:
+                        combined = f"{prev}\n{body}"
+                        # Keep last ~3000 chars to stay within card limits.
+                        if len(combined) > 3000:
+                            combined = combined[-3000:]
+                        self._card_accumulated[acc_key] = combined
+                    else:
+                        self._card_accumulated[acc_key] = body
+                        combined = body
+                    self.lark.stream_card_content(card.card_id, combined, sequence=card.sequence)
                 else:
+                    self._card_accumulated.pop(card.card_id, None)
                     footer = self._turn_card_footer(card)
                     card.sequence += 1
                     template = {"done": "green", "failed": "red", "skipped": "grey"}.get(state, "blue")

@@ -4,7 +4,8 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 
-from paper_lark_agents.app import PaperAgentBridge, TurnCard
+from paper_lark_agents.app import PaperAgentBridge
+from paper_lark_agents.turn_card import TurnCard
 from paper_lark_agents.config import load_settings
 from paper_lark_agents.lark_cli import MessageEvent
 from paper_lark_agents.router import Route
@@ -53,13 +54,15 @@ class TurnCardTests(unittest.TestCase):
         }
         with patch.dict(os.environ, env, clear=True):
             b = PaperAgentBridge(load_settings(None))
-        b.lark = FakeLark()
+        fake = FakeLark()
+        b.lark = fake
+        b.cards._lark = fake
         return b
 
     def test_start_turn_card_sends_and_returns_handle(self):
         with tempfile.TemporaryDirectory() as tmp:
             b = self.bridge(Path(tmp))
-            card = b.start_turn_card("oc_a", "codex", "gpt", "xhigh")
+            card = b.cards.acquire("oc_a", "codex", "Codex", "gpt", "xhigh")
             self.assertIsInstance(card, TurnCard)
             self.assertEqual(card.message_id, "card_1")
             self.assertEqual(len(b.lark.cards), 1)
@@ -72,10 +75,10 @@ class TurnCardTests(unittest.TestCase):
             b = self.bridge(Path(tmp))
             dashboard = FakeLark()
             b._dashboard_lark = dashboard  # distinct identity, as in serve-duo
-            card = b.start_turn_card("oc_a", "codex", "gpt", "xhigh")
-            b._render_turn_card(card, "done", "答案")
-            self.assertEqual(len(b.lark.cards), 1)        # sent under own identity
-            self.assertTrue(b.lark.updates)               # patched under own identity
+            card = b.cards.acquire("oc_a", "codex", "Codex", "gpt", "xhigh")
+            b.cards.finalize(card, "done", "答案")
+            # acquire sends 1 card, finalize sends another (terminal card)
+            self.assertEqual(len(b.lark.cards), 2)        # sent under own identity
             self.assertEqual(dashboard.cards, [])         # never touched the dashboard profile
             self.assertEqual(dashboard.updates, [])
 
@@ -85,8 +88,9 @@ class TurnCardTests(unittest.TestCase):
             card = TurnCard("card_1", "oc_a", "codex", "Codex", "gpt", "xhigh", 0.0)
             route = Route("agent", text="q", agent="codex")
             b.finalize_turn_reply(card, route, event(), "这是答案", source_agent=None, handoff_depth=0)
-            self.assertTrue(b.lark.updates)
-            self.assertIn("这是答案", card_text(b.lark.updates[-1][1]))
+            # TurnCardManager.finalize sends a terminal card for plain strategy
+            self.assertTrue(b.lark.cards)
+            self.assertIn("这是答案", card_text(b.lark.cards[-1][1]))
             self.assertIn("这是答案", b.memory.context("oc_a"))
             self.assertEqual(b.lark.markdowns, [])  # no overflow
 
@@ -95,7 +99,8 @@ class TurnCardTests(unittest.TestCase):
             b = self.bridge(Path(tmp))
             card = TurnCard("card_1", "oc_a", "codex", "Codex", "gpt", "xhigh", 0.0)
             b.finalize_turn_reply(card, Route("agent", text="q", agent="codex"), event(), "[NO_REPLY]", source_agent=None, handoff_depth=0)
-            self.assertTrue(b.lark.updates)
+            # TurnCardManager.finalize sends a terminal card for skipped state
+            self.assertTrue(b.lark.cards)
             self.assertEqual(b.memory.context("oc_a"), "No previous discussion in this Feishu group yet.")
 
     def test_no_reply_with_explanation_is_still_no_reply(self):
@@ -108,8 +113,8 @@ class TurnCardTests(unittest.TestCase):
                 source_agent=None, handoff_depth=0,
             )
             # Should be treated as no-reply, not shown as "Done" with the text.
-            self.assertTrue(b.lark.updates)
-            self.assertNotIn("[NO_REPLY]", card_text(b.lark.updates[-1][1]))
+            self.assertTrue(b.lark.cards)
+            self.assertNotIn("[NO_REPLY]", card_text(b.lark.cards[-1][1]))
             self.assertEqual(b.memory.context("oc_a"), "No previous discussion in this Feishu group yet.")
 
     def test_finalize_long_answer_overflows_to_markdown(self):
@@ -119,8 +124,8 @@ class TurnCardTests(unittest.TestCase):
             long_answer = "甲" * (limit + 500)
             card = TurnCard("card_1", "oc_a", "codex", "Codex", "gpt", "xhigh", 0.0)
             b.finalize_turn_reply(card, Route("agent", text="q", agent="codex"), event(), long_answer, source_agent=None, handoff_depth=0)
-            self.assertTrue(b.lark.updates)              # head in card
-            self.assertEqual(len(b.lark.markdowns), 1)   # tail overflowed to a message
+            self.assertTrue(b.lark.cards)                 # head in card
+            self.assertEqual(len(b.lark.markdowns), 1)    # tail overflowed to a message
 
     def test_finalize_at_peer_queues_handoff(self):
         with tempfile.TemporaryDirectory() as tmp:

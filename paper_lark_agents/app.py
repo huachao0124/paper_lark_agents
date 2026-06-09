@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
 import logging
@@ -40,6 +40,7 @@ from .prompts import (
 from .router import HELP_TEXT, Route, addressed_agents, route_message
 from .status_card import turn_reply_card
 from .status_dashboard import StatusDashboardCard, StatusDashboardDoc, StatusDashboardStore
+from .turn_card import TurnCard, TurnCardManager
 from .workspace import ChatWorkspaceStore, WorkspaceError
 
 
@@ -178,21 +179,6 @@ class StatusHandle:
         self.bridge.update_status_dashboard(self, state, detail)
 
 
-@dataclass
-class TurnCard:
-    """One interactive card per agent turn: shows live activity while running,
-    then is updated in place to become the final reply."""
-    message_id: str
-    chat_id: str
-    agent: str
-    agent_name: str
-    model: str
-    effort: str
-    started_at: float
-    card_id: str | None = None
-    sequence: int = 0
-
-
 class PaperAgentBridge:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -225,10 +211,7 @@ class PaperAgentBridge:
         self.status_dashboards = StatusDashboardStore(settings.state_dir)
         self._pending_status_updates: dict[str, float] = {}
         self._active_run_ids: set[str] = set()
-        # Track active turn cards to avoid creating duplicates when a second
-        # message arrives while the agent is still busy.
-        self._active_turn_cards: dict[str, TurnCard] = {}
-        self._turn_card_lock = threading.Lock()
+        self.cards = TurnCardManager(self.lark, self.settings)
         self._recent_handoff_sigs: set[str] = set()
         # Follow-up poller state: per (agent, chat_id), the transcript cursor
         # to watch for additional end_turn messages after the first reply.
@@ -244,6 +227,7 @@ class PaperAgentBridge:
         stale = self.pending_runs.clear_stale_cards()
         if stale:
             LOGGER.info("cleared %d stale card references from pending runs", stale)
+        self.cards.clear_all()
         self._recover_orphaned_sessions()
         stop_workers = threading.Event()
         handoff_worker = self.start_handoff_worker(stop_workers)
@@ -319,8 +303,7 @@ class PaperAgentBridge:
             self.process_pending_run(run)
 
     def _turn_card_from_run(self, run: PendingRun) -> TurnCard | None:
-        card_key = f"{run.agent}:{run.chat_id}"
-        cached = self._active_turn_cards.get(card_key)
+        cached = self.cards.active_for(run.agent, run.chat_id)
         if cached and cached.message_id:
             return cached
         if not run.status_message_id:
@@ -368,33 +351,20 @@ class PaperAgentBridge:
                     pass
                 if not still_busy:
                     if card:
-                        self._render_turn_card(card, "failed", "超时未完成，请重试。")
-                        with self._turn_card_lock:
-                            self._active_turn_cards.pop(f"{card.agent}:{card.chat_id}", None)
+                        self.cards.finalize(card, "failed", "超时未完成，请重试。")
                     self.pending_runs.mark_done(run.run_id, status="timeout")
                     LOGGER.info("pending run %s timed out after %.0fs (agent idle)", run.run_id, age)
                     return
             if not card and self.settings.send_progress:
                 # Use a plain card (not streaming) for pending run progress —
                 # streaming cards time out after 10 min, but agents can run for hours.
-                agent_name = self.agent_display_name(run.agent)
-                plain = turn_reply_card(agent_name, "running", "仍在处理…",
-                    model=run.model_label or self.chat_model_label(run.chat_id, run.agent),
-                    effort=run.effort_label or self.chat_effort_label(run.chat_id, run.agent),
-                    started_at=time.time(),
+                card = self.cards.acquire(
+                    run.chat_id, run.agent,
+                    self.agent_display_name(run.agent),
+                    run.model_label or self.chat_model_label(run.chat_id, run.agent),
+                    run.effort_label or self.chat_effort_label(run.chat_id, run.agent),
+                    strategy="plain",
                 )
-                try:
-                    result = self.lark.send_card(run.chat_id, plain)
-                    msg_id = first_field(result, "message_id") or first_field(result, "id")
-                    if msg_id:
-                        card = TurnCard(str(msg_id), run.chat_id, run.agent, agent_name,
-                            run.model_label or self.chat_model_label(run.chat_id, run.agent),
-                            run.effort_label or self.chat_effort_label(run.chat_id, run.agent),
-                            time.time())
-                        card_key = f"{run.agent}:{run.chat_id}"
-                        self._active_turn_cards[card_key] = card
-                except LarkCLIError as exc:
-                    LOGGER.warning("pending run card create failed: %s", exc)
             self.update_recovered_status(run, card)
             return
         if not self.pending_runs.claim(run.run_id):
@@ -405,8 +375,9 @@ class PaperAgentBridge:
             # If the run had no card (was queued while another card was active),
             # create one now — the previous card should be finished by now.
             if not card and self.settings.send_progress:
-                card = self.start_turn_card(
+                card = self.cards.acquire(
                     run.chat_id, run.agent,
+                    self.agent_display_name(run.agent),
                     run.model_label or self.chat_model_label(run.chat_id, run.agent),
                     run.effort_label or self.chat_effort_label(run.chat_id, run.agent),
                 )
@@ -439,13 +410,10 @@ class PaperAgentBridge:
     def update_recovered_status(self, run: PendingRun, card: TurnCard | None) -> None:
         if not card:
             return
-        # Cache the card so streaming renewals persist across polls.
-        card_key = f"{card.agent}:{card.chat_id}"
-        cached = self._active_turn_cards.get(card_key)
+        # Prefer the live card tracked by the manager.
+        cached = self.cards.active_for(card.agent, card.chat_id)
         if cached and cached.message_id:
             card = cached
-        elif card.message_id:
-            self._active_turn_cards[card_key] = card
         if not card.message_id:
             return
         interval = max(1, self.settings.status_update_seconds)
@@ -465,7 +433,7 @@ class PaperAgentBridge:
             pass
         if not detail:
             detail = self.agents.session_progress(run.agent, run.chat_id) or "仍在处理,完成后这张卡会更新成回复…"
-        self._render_turn_card(card, "running", detail)
+        self.cards.update(card, detail)
         self._pending_status_updates[run.run_id] = time.time()
 
     def recovered_status_handle(self, run: PendingRun) -> StatusHandle | None:
@@ -891,9 +859,10 @@ class PaperAgentBridge:
             model = self.chat_model_override(event.chat_id, route.agent)
             turn_card = None
             if self.settings.send_progress:
-                turn_card = self.start_turn_card(
+                turn_card = self.cards.acquire(
                     event.chat_id,
                     route.agent,
+                    self.agent_display_name(route.agent),
                     self.chat_model_label(event.chat_id, route.agent),
                     self.chat_effort_label(event.chat_id, route.agent),
                     force=source_agent is None,  # human message takes priority
@@ -942,7 +911,7 @@ class PaperAgentBridge:
                         workspace=workspace,
                         model=model,
                         effort=effort,
-                        progress_callback=(lambda detail: self.update_turn_card(turn_card, detail))
+                        progress_callback=(lambda detail: self.cards.update(turn_card, detail))
                         if turn_card
                         else None,
                         run_id=run_id,
@@ -955,21 +924,21 @@ class PaperAgentBridge:
                         workspace=workspace,
                         model=model,
                         effort=effort,
-                        progress_callback=(lambda detail: self.update_turn_card(turn_card, detail))
+                        progress_callback=(lambda detail: self.cards.update(turn_card, detail))
                         if turn_card
                         else None,
                         run_id=run_id,
                     )
             except AgentStillRunning as exc:
                 if turn_card:
-                    self._render_turn_card(turn_card, "running", "仍在处理,完成后这张卡会更新成回复…")
+                    self.cards.update(turn_card, "仍在处理,完成后这张卡会更新成回复…")
                 if run_id:
                     self._active_run_ids.discard(run_id)
                 LOGGER.info("%s run still running in %s: %s", route.agent, event.chat_id, exc)
                 return ""
             except Exception:
                 if turn_card:
-                    self._render_turn_card(turn_card, "failed", "运行失败,稍后会发送错误信息。")
+                    self.cards.finalize(turn_card, "failed", "运行失败,稍后会发送错误信息。")
                 if run_id:
                     self.pending_runs.mark_done(run_id, status="failed")
                     self._active_run_ids.discard(run_id)
@@ -1118,8 +1087,9 @@ class PaperAgentBridge:
         card for live progress — same UX as a normal agent turn."""
         runtime = self.agents.codex_session if agent == "codex" else self.agents.claude_session
         session_name = runtime.session_name(chat_id)
-        turn_card = self.start_turn_card(
+        turn_card = self.cards.acquire(
             chat_id, agent,
+            self.agent_display_name(agent),
             self.chat_model_label(chat_id, agent),
             self.chat_effort_label(chat_id, agent),
             force=True,  # session command is human-initiated
@@ -1146,13 +1116,13 @@ class PaperAgentBridge:
             text, usage, cursor = runtime.wait_for_jsonl_reply(
                 session_name, chat_id, workspace, path_str, offset,
                 self.agent_timeout(agent),
-                progress_callback=(lambda d: self.update_turn_card(turn_card, d))
+                progress_callback=(lambda d: self.cards.update(turn_card, d))
                 if turn_card else None,
                 progress_interval=self.settings.status_update_seconds,
             )
         except TmuxReplyStillRunning:
             if turn_card:
-                self._render_turn_card(turn_card, "running", "仍在处理,完成后这张卡会更新成回复…")
+                self.cards.update(turn_card, "仍在处理,完成后这张卡会更新成回复…")
             LOGGER.info("%s session command still running in %s", agent, chat_id)
             return ""
         self.pending_runs.mark_done(run_id)
@@ -1829,172 +1799,6 @@ class PaperAgentBridge:
             summary = summary[:497].rstrip() + "..."
         status.update(state, summary)
 
-    def _supports_streaming_cards(self) -> bool:
-        return hasattr(self.lark, "create_streaming_card")
-
-    def start_turn_card(
-        self, chat_id: str, agent: str, model: str, effort: str, *, force: bool = False,
-    ) -> TurnCard | None:
-        card_key = f"{agent}:{chat_id}"
-        with self._turn_card_lock:
-            old = self._active_turn_cards.get(card_key)
-            if old:
-                if not force:
-                    return None
-                if old.card_id and self._supports_streaming_cards():
-                    try:
-                        self.lark.finalize_streaming_card(
-                            old.card_id,
-                            title=f"{old.agent_name} · Interrupted",
-                            template="grey",
-                            sequence=old.sequence + 1,
-                        )
-                    except Exception:
-                        pass
-                self._active_turn_cards.pop(card_key, None)
-            agent_name = self.agent_display_name(agent)
-            started_at = time.time()
-            if self._supports_streaming_cards():
-                try:
-                    card_id = self.lark.create_streaming_card(f"{agent_name} · Running")
-                    message_id = self.lark.send_streaming_card(chat_id, card_id)
-                except LarkCLIError as exc:
-                    LOGGER.warning("streaming card send failed: %s", exc)
-                    return None
-                if not message_id:
-                    return None
-                self.outbox.remember_message_id(chat_id, message_id, agent=agent, discussion_trigger=False)
-                turn_card = TurnCard(message_id, chat_id, agent, agent_name, model, effort, started_at, card_id=card_id, sequence=0)
-                self._active_turn_cards[card_key] = turn_card
-                return turn_card
-            card = turn_reply_card(agent_name, "running", "✻ 思考中", model=model, effort=effort, started_at=started_at)
-            try:
-                result = self.lark.send_card(chat_id, card)
-            except LarkCLIError as exc:
-                LOGGER.warning("turn card send failed: %s", exc)
-                return None
-            message_id = first_field(result, "message_id") or first_field(result, "id")
-            if not message_id:
-                return None
-            self.outbox.remember_message_id(chat_id, str(message_id), agent=agent, discussion_trigger=False)
-            turn_card = TurnCard(str(message_id), chat_id, agent, agent_name, model, effort, started_at)
-            self._active_turn_cards[card_key] = turn_card
-            return turn_card
-
-    _card_accumulated: dict[str, str] = {}
-
-    def _render_turn_card(self, card: TurnCard, state: str, body: str) -> bool:
-        if card.card_id and self._supports_streaming_cards():
-            try:
-                if state == "running":
-                    card.sequence += 1
-                    # Accumulate progress updates so earlier lines are not lost.
-                    acc_key = card.card_id
-                    prev = self._card_accumulated.get(acc_key, "")
-                    if prev and body not in prev:
-                        combined = f"{prev}\n{body}"
-                        # Keep last ~3000 chars to stay within card limits.
-                        if len(combined) > 3000:
-                            combined = combined[-3000:]
-                        self._card_accumulated[acc_key] = combined
-                    else:
-                        self._card_accumulated[acc_key] = body
-                        combined = body
-                    self.lark.stream_card_content(card.card_id, combined, sequence=card.sequence)
-                else:
-                    self._card_accumulated.pop(card.card_id, None)
-                    footer = self._turn_card_footer(card)
-                    card.sequence += 1
-                    template = {"done": "green", "failed": "red", "skipped": "grey"}.get(state, "blue")
-                    title = f"{card.agent_name} · {state.title()}"
-                    self.lark.finalize_streaming_card(
-                        card.card_id,
-                        final_content=body,
-                        title=title,
-                        template=template,
-                        sequence=card.sequence,
-                        footer=footer,
-                    )
-            except LarkCLIError as exc:
-                LOGGER.warning("streaming card update failed for %s: %s", card.card_id, exc)
-                if state == "running":
-                    # Streaming timed out mid-turn. Delete the dead card and
-                    # create a fresh streaming card to continue.
-                    old_msg_id = card.message_id
-                    try:
-                        new_card_id = self.lark.create_streaming_card(f"{card.agent_name} · Running")
-                        new_msg_id = self.lark.send_streaming_card(card.chat_id, new_card_id)
-                        if old_msg_id:
-                            self._delete_stuck_card(old_msg_id)
-                        card.card_id = new_card_id
-                        card.message_id = new_msg_id
-                        card.sequence = 1
-                        card.started_at = time.time()
-                        self.lark.stream_card_content(new_card_id, body, sequence=1)
-                        return True
-                    except LarkCLIError:
-                        pass
-                # For terminal states (done/failed), delete the stuck Running
-                # card and send a fresh Done card.
-                old_msg_id = card.message_id
-                card.card_id = None
-                card.message_id = ""
-                if old_msg_id:
-                    self._delete_stuck_card(old_msg_id)
-                done_card = turn_reply_card(
-                    card.agent_name, state, body,
-                    model=card.model, effort=card.effort, started_at=card.started_at,
-                )
-                try:
-                    result = self.lark.send_card(card.chat_id, done_card)
-                    msg_id = first_field(result, "message_id")
-                    if msg_id:
-                        card.message_id = str(msg_id)
-                    return True
-                except LarkCLIError as exc2:
-                    LOGGER.warning("fallback card send failed: %s", exc2)
-                    return False
-            return True
-        rendered = turn_reply_card(
-            card.agent_name, state, body, model=card.model, effort=card.effort, started_at=card.started_at
-        )
-        try:
-            self.lark.update_card(card.message_id, rendered)
-        except LarkCLIError as exc:
-            LOGGER.warning("turn card update failed for %s: %s", card.message_id, exc)
-            err = str(exc)
-            if "schemaV2" in err or "200830" in err or "withdrawn" in err or "230011" in err:
-                card.message_id = ""
-            return False
-        return True
-
-    def _delete_stuck_card(self, message_id: str) -> None:
-        try:
-            if hasattr(self.lark, '_client'):
-                from lark_oapi.api.im.v1 import DeleteMessageRequest
-                req = DeleteMessageRequest.builder().message_id(message_id).build()
-                self.lark._client.im.v1.message.delete(req)
-            else:
-                import subprocess
-                cmd = [self.settings.lark_cli]
-                if self.settings.lark_profile:
-                    cmd.extend(["--profile", self.settings.lark_profile])
-                cmd.extend(["im", "messages", "delete", "--as", "bot", "--yes",
-                            "--params", json.dumps({"message_id": message_id})])
-                subprocess.run(cmd, capture_output=True, check=False)
-        except Exception as exc:
-            LOGGER.debug("failed to delete stuck card %s: %s", message_id, exc)
-
-    def _turn_card_footer(self, card: TurnCard) -> str:
-        elapsed = max(0, int(time.time() - card.started_at))
-        parts = []
-        if card.model:
-            parts.append(card.model)
-        if card.effort:
-            parts.append(card.effort)
-        parts.append(f"{elapsed}s")
-        return " · ".join(parts)
-
     def register_followup_cursor(
         self,
         agent: str,
@@ -2198,20 +2002,15 @@ class PaperAgentBridge:
                 LOGGER.info("follow-up reply from %s in %s", agent, event.chat_id)
                 if self.settings.send_progress:
                     agent_name = self.agent_display_name(agent)
-                    done_card = turn_reply_card(
-                        agent_name, "done", text[:self.settings.max_message_chars],
+                    msg_id = self.cards.send_done_card(
+                        event.chat_id, agent, agent_name,
+                        text[:self.settings.max_message_chars],
                         model=self.chat_model_label(event.chat_id, agent),
                         effort=self.chat_effort_label(event.chat_id, agent),
-                        started_at=time.time(),
                     )
-                    try:
-                        result = self.lark.send_card(event.chat_id, done_card)
-                        msg_id = first_field(result, "message_id")
-                        LOGGER.info("follow-up card sent for %s in %s: %s", agent, event.chat_id, msg_id or "no msg_id")
-                        if msg_id:
-                            self.outbox.remember_message_id(event.chat_id, str(msg_id), agent=agent, discussion_trigger=False)
-                    except LarkCLIError as exc:
-                        LOGGER.warning("follow-up card send failed: %s", exc)
+                    LOGGER.info("follow-up card sent for %s in %s: %s", agent, event.chat_id, msg_id or "no msg_id")
+                    if msg_id:
+                        self.outbox.remember_message_id(event.chat_id, msg_id, agent=agent, discussion_trigger=False)
                     if self.settings.enable_memory:
                         self.memory.append_assistant(event.chat_id, agent, text)
                     if self.should_enqueue_teammate_handoff(route, text, depth):
@@ -2235,10 +2034,6 @@ class PaperAgentBridge:
             if dirty:
                 self._persist_followup_cursors()
 
-    def update_turn_card(self, card: TurnCard | None, detail: str) -> None:
-        if card:
-            self._render_turn_card(card, "running", detail)
-
     def finalize_turn_reply(
         self,
         card: TurnCard,
@@ -2250,13 +2045,11 @@ class PaperAgentBridge:
         handoff_depth: int,
     ) -> None:
         if self.is_no_reply(text):
-            self._render_turn_card(card, "skipped", "—")
-            with self._turn_card_lock:
-                self._active_turn_cards.pop(f"{card.agent}:{card.chat_id}", None)
+            self.cards.finalize(card, "skipped", "—")
             return
         limit = self.settings.max_message_chars
         head = text if len(text) <= limit else text[:limit].rstrip() + "\n\n…（下接）"
-        if not self._render_turn_card(card, "done", head):
+        if not self.cards.finalize(card, "done", head):
             # Card update failed — deliver the full reply as text so it is never lost.
             self.send_bridge_markdown(card.chat_id, text, agent=route.agent, discussion_trigger=False)
         elif len(text) > limit:
@@ -2275,9 +2068,6 @@ class PaperAgentBridge:
         self.outbox.remember_message_id(card.chat_id, card.message_id, agent=route.agent, discussion_trigger=False)
         if self.settings.enable_memory:
             self.memory.append_assistant(card.chat_id, route.agent, text)
-        # Release the card slot so the next queued message can get its own card.
-        with self._turn_card_lock:
-            self._active_turn_cards.pop(f"{card.agent}:{card.chat_id}", None)
 
     def start_agent_status(
         self,

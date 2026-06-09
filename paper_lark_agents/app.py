@@ -436,6 +436,16 @@ class PaperAgentBridge:
             pass
         if not detail:
             detail = self.agents.session_progress(run.agent, run.chat_id) or "仍在处理,完成后这张卡会更新成回复…"
+        # Check tmux screen for errors the agent can't recover from.
+        try:
+            runtime = self.agents.codex_session if run.agent == "codex" else self.agents.claude_session
+            session_name = runtime.session_name(run.chat_id)
+            screen = runtime.capture(session_name)
+            error = _detect_screen_error(screen)
+            if error:
+                detail = f"⚠️ {error}\n\n{detail}"
+        except Exception:
+            pass
         self.cards.update(card, detail)
         self._pending_status_updates[run.run_id] = time.time()
 
@@ -2454,6 +2464,31 @@ class PaperAgentBridge:
         stripped = reply.strip()
         token = self.settings.no_reply_token
         return stripped == token or stripped.startswith(token + " ") or stripped.startswith(token + "—") or stripped.startswith(token + "\n")
+
+
+_SCREEN_ERROR_PATTERNS = [
+    "at capacity",
+    "rate limit",
+    "429",
+    "500 Internal Server Error",
+    "502 Bad Gateway",
+    "503 Service Unavailable",
+    "ECONNREFUSED",
+    "ETIMEDOUT",
+    "network error",
+    "connection reset",
+]
+
+
+def _detect_screen_error(screen: str) -> str | None:
+    lines = [l.strip() for l in screen.splitlines() if l.strip()]
+    tail = "\n".join(lines[-8:])
+    for pattern in _SCREEN_ERROR_PATTERNS:
+        if pattern.lower() in tail.lower():
+            for line in reversed(lines[-8:]):
+                if pattern.lower() in line.lower():
+                    return line[:200]
+    return None
 
 
 def format_standalone_upload_reply(downloaded: list[tuple[str, Path]]) -> str:

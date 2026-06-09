@@ -319,6 +319,10 @@ class PaperAgentBridge:
             self.process_pending_run(run)
 
     def _turn_card_from_run(self, run: PendingRun) -> TurnCard | None:
+        card_key = f"{run.agent}:{run.chat_id}"
+        cached = self._active_turn_cards.get(card_key)
+        if cached and cached.message_id:
+            return cached
         if not run.status_message_id:
             return None
         return TurnCard(

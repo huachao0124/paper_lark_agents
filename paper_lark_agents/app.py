@@ -1638,16 +1638,16 @@ class PaperAgentBridge:
         return self.efforts.current(chat_id, agent) or self.default_effort(agent)
 
     def chat_effort_label(self, chat_id: str, agent: str) -> str:
+        detected = self.detect_session_effort_label(chat_id, agent)
+        if detected:
+            return detected
         current = self.efforts.current(chat_id, agent)
         if current:
             return f"{current} (group)"
         default = self.default_effort(agent)
         if default:
             return f"{default} (default)"
-        detected = self.detect_session_effort_label(chat_id, agent)
-        if detected:
-            return detected
-        return "CLI default (not set by bridge)"
+        return "CLI default"
 
     def default_effort(self, agent: str) -> str | None:
         if agent == "codex":
@@ -1670,16 +1670,16 @@ class PaperAgentBridge:
         return self.models.current(chat_id, agent)
 
     def chat_model_label(self, chat_id: str, agent: str) -> str:
+        detected = self.detect_session_model_label(chat_id, agent)
+        if detected:
+            return detected
         current = self.models.current(chat_id, agent)
         if current:
             return f"{current} (group)"
         default = self.default_model(agent)
         if default:
             return f"{default} (default)"
-        detected = self.detect_session_model_label(chat_id, agent)
-        if detected:
-            return detected
-        return "CLI default (not set by bridge)"
+        return "CLI default"
 
     def detect_session_model_label(self, chat_id: str, agent: str) -> str | None:
         detected = self.agents.detect_session_model(agent, chat_id)

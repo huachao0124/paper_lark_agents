@@ -72,6 +72,7 @@ class TmuxSessionRuntime:
         self.session_id = session_id or agent
         self._chat_labels: dict[str, str] = {}
         self._session_locks: dict[str, threading.Lock] = {}
+        self._session_locks_guard = threading.Lock()
 
     def run(
         self,
@@ -656,9 +657,10 @@ class TmuxSessionRuntime:
         return proc.returncode == 0
 
     def _session_lock(self, session_name: str) -> threading.Lock:
-        if session_name not in self._session_locks:
-            self._session_locks[session_name] = threading.Lock()
-        return self._session_locks[session_name]
+        with self._session_locks_guard:
+            if session_name not in self._session_locks:
+                self._session_locks[session_name] = threading.Lock()
+            return self._session_locks[session_name]
 
     def paste_and_submit(self, session_name: str, text: str) -> None:
         with self._session_lock(session_name):

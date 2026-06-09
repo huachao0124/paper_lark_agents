@@ -259,7 +259,9 @@ class PaperAgentBridge:
         try:
             self.lark.consume_events(self.handle_lark_event)
         except Exception:
-            LOGGER.exception("event consumer died")
+            LOGGER.exception("event consumer died, process will exit")
+            import os
+            os._exit(1)
 
     def _load_chat_names(self) -> None:
         """Query Feishu for group names and register them with the session runtimes."""
@@ -1997,6 +1999,7 @@ class PaperAgentBridge:
             for k in list(self._interactive_prompts):
                 if k.endswith(f":{event.chat_id}"):
                     self._interactive_prompts.pop(k, None)
+            self._save_interactive_state()
             self.send_progress_markdown(event.chat_id, f"已选择: {tmux_key}")
             LOGGER.info("forwarded interactive reply '%s' to %s", tmux_key, session_name)
             return True

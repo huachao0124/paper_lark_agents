@@ -220,9 +220,9 @@ class PaperAgentBridge:
         self._followup_cursors: dict[str, tuple[str, int, MessageEvent, Route, str | None, int]] = {}
         self._followup_lock = threading.Lock()
         # Interactive prompt state: agent:chat_id -> last detected prompt hash.
-        # Used to avoid re-sending the same prompt and to intercept replies.
         self._interactive_prompts: dict[str, str] = {}  # key -> prompt hash
         self._interactive_sessions: dict[str, str] = {}  # chat_id -> session_name
+        self._interactive_state_path = self.settings.state_dir / "interactive_prompts.json"
 
     def serve(self) -> None:
         self._load_followup_cursors()
@@ -638,10 +638,15 @@ class PaperAgentBridge:
             return
 
         # Intercept replies to interactive prompts (e.g., "1", "2", "esc").
-        if event.chat_id in self._interactive_sessions:
+        # Check both local state and shared file (other process may own the prompt).
+        shared = self._load_interactive_state()
+        all_interactive = {**shared, **self._interactive_sessions}
+        if event.chat_id in all_interactive:
             tmux_key = _is_interactive_reply(event.content)
             if tmux_key:
-                self._handle_interactive_reply(event, tmux_key)
+                if event.chat_id in self._interactive_sessions:
+                    self._handle_interactive_reply(event, tmux_key)
+                # Either way, don't route this message normally.
                 return
 
         try:
@@ -1931,6 +1936,7 @@ class PaperAgentBridge:
             key = f"{agent}:{chat_id}"
             self._interactive_prompts.pop(key, None)
             self._interactive_sessions.pop(chat_id, None)
+            self._save_interactive_state()
             return
         prompt_hash = str(hash(tuple(prompt["options"])))
         key = f"{agent}:{chat_id}"
@@ -1938,9 +1944,31 @@ class PaperAgentBridge:
             return
         self._interactive_prompts[key] = prompt_hash
         self._interactive_sessions[chat_id] = session_name
+        self._save_interactive_state()
         msg = format_prompt_message(prompt)
         LOGGER.info("interactive prompt detected in %s for %s", session_name, chat_id)
         self.send_progress_markdown(chat_id, msg)
+
+    def _save_interactive_state(self) -> None:
+        try:
+            data = {
+                chat_id: session_name
+                for chat_id, session_name in self._interactive_sessions.items()
+            }
+            self._interactive_state_path.parent.mkdir(parents=True, exist_ok=True)
+            self._interactive_state_path.write_text(
+                json.dumps(data, ensure_ascii=False), encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    def _load_interactive_state(self) -> dict[str, str]:
+        try:
+            if self._interactive_state_path.exists():
+                return json.loads(self._interactive_state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            pass
+        return {}
 
     def _handle_interactive_reply(
         self, event: MessageEvent, tmux_key: str,

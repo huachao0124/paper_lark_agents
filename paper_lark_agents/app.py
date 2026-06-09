@@ -535,22 +535,37 @@ class PaperAgentBridge:
         )
         if self.settings.enable_memory:
             self.memory.append_assistant(handoff.chat_id, handoff.source_agent, handoff.content)
-        reply = self.dispatch(
-            route,
-            event,
-            source_agent=handoff.source_agent,
-            handoff_depth=handoff.depth,
-        )
-        if reply and not self.is_no_reply(reply):
-            self.send_reply(
-                event,
+        # Run dispatch in a separate thread so the handoff worker is not
+        # blocked by wait_for_jsonl_reply (can take 900s+ to timeout).
+        threading.Thread(
+            target=self._dispatch_handoff_safe,
+            args=(route, event, handoff),
+            daemon=True,
+            name=f"handoff-{handoff.handoff_id[:8]}",
+        ).start()
+
+    def _dispatch_handoff_safe(
+        self, route: Route, event: MessageEvent, handoff: "AgentHandoff",
+    ) -> None:
+        try:
+            reply = self.dispatch(
                 route,
-                reply,
+                event,
                 source_agent=handoff.source_agent,
                 handoff_depth=handoff.depth,
             )
-            if self.settings.enable_memory:
-                self.memory.append_assistant(handoff.chat_id, handoff.target_agent, reply)
+            if reply and not self.is_no_reply(reply):
+                self.send_reply(
+                    event,
+                    route,
+                    reply,
+                    source_agent=handoff.source_agent,
+                    handoff_depth=handoff.depth,
+                )
+                if self.settings.enable_memory:
+                    self.memory.append_assistant(handoff.chat_id, handoff.target_agent, reply)
+        except Exception:
+            LOGGER.exception("handoff dispatch failed for %s", handoff.handoff_id)
 
     def handle_lark_event(self, event: LarkEvent) -> None:
         if event.event_type == BOT_ADDED_EVENT_TYPE:

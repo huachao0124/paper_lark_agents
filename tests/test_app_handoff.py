@@ -194,6 +194,7 @@ class AppHandoffTests(unittest.TestCase):
             claude.agents = fake_agents
 
             claude.process_pending_handoffs("claude")
+            import time; time.sleep(0.5)  # handoff dispatch runs in a thread
 
             self.assertIn("source: assistant:codex", fake_agents.claude_prompts[0])
             self.assertEqual(fake_lark.markdowns, [("oc_a", "Claude follow-up")])
@@ -226,6 +227,7 @@ class AppHandoffTests(unittest.TestCase):
             claude.lark = FakeLark()
             claude.agents = fake_agents
             claude.process_pending_handoffs("claude")
+            import time; time.sleep(0.5)
 
             prompt = fake_agents.claude_prompts[0]
             # Claude now sees the human's original ask and codex's earlier turn,

@@ -367,6 +367,32 @@ class PaperAgentBridge:
                     self.pending_runs.mark_done(run.run_id, status="timeout")
                     LOGGER.info("pending run %s timed out after %.0fs (agent idle)", run.run_id, age)
                     return
+            if not card and self.settings.send_progress:
+                card = self.start_turn_card(
+                    run.chat_id, run.agent,
+                    run.model_label or self.chat_model_label(run.chat_id, run.agent),
+                    run.effort_label or self.chat_effort_label(run.chat_id, run.agent),
+                )
+                if card:
+                    run = PendingRun(
+                        **(run.__dict__ if hasattr(run, '__dict__') else {}),
+                    ) if False else run  # keep run unchanged, just update the pending store
+                    # Persist the new card info for future polls
+                    self.pending_runs.mark_done(run.run_id, status="upgraded")
+                    self.pending_runs.start(
+                        run_id=run.run_id, chat_id=run.chat_id, agent=run.agent,
+                        route_text=run.route_text, event_id=run.event_id,
+                        message_id=run.message_id, sender_id=run.sender_id,
+                        message_type=run.message_type, chat_type=run.chat_type,
+                        event_content=run.event_content, source_agent=run.source_agent,
+                        handoff_depth=run.handoff_depth,
+                        start_marker=run.start_marker, end_marker=run.end_marker,
+                        session_name=run.session_name, workspace=run.workspace,
+                        status_message_id=card.message_id,
+                        card_id=card.card_id,
+                        model_label=card.model, effort_label=card.effort,
+                        timeout=run.timeout,
+                    )
             self.update_recovered_status(run, card)
             return
         if not self.pending_runs.claim(run.run_id):

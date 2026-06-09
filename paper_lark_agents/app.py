@@ -447,9 +447,19 @@ class PaperAgentBridge:
         last = self._pending_status_updates.get(run.run_id, 0.0)
         if time.time() - last < interval:
             return
-        detail = self.agents.session_progress(run.agent, run.chat_id) or (
-            "仍在处理,完成后这张卡会更新成回复…"
-        )
+        detail = None
+        try:
+            runtime = self.agents.codex_session if run.agent == "codex" else self.agents.claude_session
+            session_name = runtime.session_name(run.chat_id)
+            transcript_path = (runtime.read_metadata(session_name) or {}).get("transcript_path")
+            if transcript_path and Path(transcript_path).exists():
+                from .transcripts import activity_detail, read_new_jsonl
+                recent_lines, _ = read_new_jsonl(Path(transcript_path), max(0, Path(transcript_path).stat().st_size - 50000))
+                detail = activity_detail(recent_lines, run.agent)
+        except Exception:
+            pass
+        if not detail:
+            detail = self.agents.session_progress(run.agent, run.chat_id) or "仍在处理,完成后这张卡会更新成回复…"
         self._render_turn_card(card, "running", detail)
         self._pending_status_updates[run.run_id] = time.time()
 

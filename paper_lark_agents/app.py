@@ -2078,12 +2078,12 @@ class PaperAgentBridge:
                 if not isinstance(cursor_val, list) or len(cursor_val) != 2:
                     continue
                 path_str = str(cursor_val[0])
-                from .tmux_runtime import session_tail_busy
+                from .tmux_runtime import session_tail_busy, session_ready_for_current_input
                 try:
                     screen = runtime.capture(session_name)
-                    still_busy = session_tail_busy(screen)
+                    still_busy = not session_ready_for_current_input(screen, agent)
                 except Exception:
-                    still_busy = False
+                    still_busy = True
                 if still_busy:
                     # Agent still working — set cursor to file end so we
                     # only detect NEW replies, not old already-delivered ones.

@@ -2077,16 +2077,25 @@ class PaperAgentBridge:
                 cursor_val = cursors[last_run_id]
                 if not isinstance(cursor_val, list) or len(cursor_val) != 2:
                     continue
-                path_str, offset = str(cursor_val[0]), int(cursor_val[1])
-                reply = runtime.read_jsonl_reply(path_str, offset)
+                path_str = str(cursor_val[0])
                 from .tmux_runtime import session_tail_busy
                 try:
                     screen = runtime.capture(session_name)
                     still_busy = session_tail_busy(screen)
                 except Exception:
                     still_busy = False
-                if not reply and not still_busy:
-                    continue
+                if still_busy:
+                    # Agent still working — set cursor to file end so we
+                    # only detect NEW replies, not old already-delivered ones.
+                    try:
+                        offset = Path(path_str).stat().st_size if Path(path_str).exists() else 0
+                    except OSError:
+                        offset = 0
+                else:
+                    offset = int(cursor_val[1])
+                    reply = runtime.read_jsonl_reply(path_str, offset)
+                    if not reply:
+                        continue
                 run_id = uuid.uuid4().hex
                 start_marker, end_marker = runtime.reply_markers(run_id)
                 runtime.store_run_cursor(session_name, run_id, path_str, offset)

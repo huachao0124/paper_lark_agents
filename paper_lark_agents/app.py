@@ -374,13 +374,10 @@ class PaperAgentBridge:
                     run.effort_label or self.chat_effort_label(run.chat_id, run.agent),
                 )
                 if card:
-                    run = PendingRun(
-                        **(run.__dict__ if hasattr(run, '__dict__') else {}),
-                    ) if False else run  # keep run unchanged, just update the pending store
-                    # Persist the new card info for future polls
                     self.pending_runs.mark_done(run.run_id, status="upgraded")
+                    new_run_id = uuid.uuid4().hex
                     self.pending_runs.start(
-                        run_id=run.run_id, chat_id=run.chat_id, agent=run.agent,
+                        run_id=new_run_id, chat_id=run.chat_id, agent=run.agent,
                         route_text=run.route_text, event_id=run.event_id,
                         message_id=run.message_id, sender_id=run.sender_id,
                         message_type=run.message_type, chat_type=run.chat_type,

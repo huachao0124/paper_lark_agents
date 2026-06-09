@@ -57,6 +57,8 @@ class TurnCardManager:
             self._accumulated.clear()
         return count
 
+    _creating: set[str] = set()
+
     def acquire(
         self,
         chat_id: str,
@@ -75,16 +77,19 @@ class TurnCardManager:
                 if not force:
                     return None
                 self._active.pop(key, None)
+            elif key in self._creating:
+                return None
+            self._creating.add(key)
         if old and force:
             LOGGER.info("interrupting old card %s for %s", old.message_id[:12], key)
             self._interrupt_card(old)
         if strategy == "auto":
             strategy = "streaming" if self._supports_streaming() else "plain"
         card = self._create_card(chat_id, agent, agent_name, model, effort, strategy)
-        if not card:
-            return None
         with self._lock:
-            self._active[key] = card
+            self._creating.discard(key)
+            if card:
+                self._active[key] = card
         return card
 
     def update(self, card: TurnCard, detail: str) -> None:

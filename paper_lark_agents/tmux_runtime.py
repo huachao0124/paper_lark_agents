@@ -209,6 +209,7 @@ class TmuxSessionRuntime:
                     self.configure_window_size(session_name)
                     self.ensure_transcript_pipe(session_name)
                     self.refresh_detected_session_labels(session_name)
+                    self._clear_stale_input(session_name)
                     return not self.session_initialized(session_name)
             # Only workspace changed (model/effort/args unchanged) — try to
             # preserve the agent's conversation context.
@@ -400,6 +401,27 @@ class TmuxSessionRuntime:
         has_bash = bool(re.search(r"\$\s*$|bash.*command not found", tail))
         has_cli = "❯" in tail or "›" in tail or "esc to interrupt" in tail
         return has_bash and not has_cli
+
+    def _clear_stale_input(self, session_name: str) -> None:
+        """Clear any leftover pasted content in the input line.
+
+        If bridge was killed between paste and Enter, the prompt has
+        stale text that would be submitted on the next paste_and_submit.
+        """
+        try:
+            screen = self.capture(session_name)
+            if "[Pasted Content" in screen or "Press up to edit queued" in screen:
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", session_name, "C-u"],
+                    text=True, capture_output=True, check=False,
+                )
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", session_name, "Escape"],
+                    text=True, capture_output=True, check=False,
+                )
+                LOGGER.info("cleared stale input in %s", session_name)
+        except (subprocess.CalledProcessError, AttributeError):
+            pass
 
     def _clear_stale_transcript(self, session_name: str) -> None:
         data = self.read_metadata(session_name)

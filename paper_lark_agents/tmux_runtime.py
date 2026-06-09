@@ -10,6 +10,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from typing import Callable
 import uuid
@@ -70,6 +71,7 @@ class TmuxSessionRuntime:
         self.agent = agent
         self.session_id = session_id or agent
         self._chat_labels: dict[str, str] = {}
+        self._session_locks: dict[str, threading.Lock] = {}
 
     def run(
         self,
@@ -653,19 +655,25 @@ class TmuxSessionRuntime:
         )
         return proc.returncode == 0
 
+    def _session_lock(self, session_name: str) -> threading.Lock:
+        if session_name not in self._session_locks:
+            self._session_locks[session_name] = threading.Lock()
+        return self._session_locks[session_name]
+
     def paste_and_submit(self, session_name: str, text: str) -> None:
-        self.dismiss_claude_feedback_prompt_if_visible(session_name)
-        LOGGER.info("paste_and_submit to %s (%d chars)", session_name, len(text))
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
-            handle.write(text)
-            temp_path = Path(handle.name)
-        try:
-            subprocess.run(["tmux", "send-keys", "-t", session_name, "C-u"], check=True)
-            subprocess.run(["tmux", "load-buffer", str(temp_path)], check=True)
-            subprocess.run(["tmux", "paste-buffer", "-p", "-t", session_name], check=True)
-            subprocess.run(["tmux", "send-keys", "-t", session_name, "Enter"], check=True)
-        finally:
-            temp_path.unlink(missing_ok=True)
+        with self._session_lock(session_name):
+            self.dismiss_claude_feedback_prompt_if_visible(session_name)
+            LOGGER.info("paste_and_submit to %s (%d chars)", session_name, len(text))
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+                handle.write(text)
+                temp_path = Path(handle.name)
+            try:
+                subprocess.run(["tmux", "send-keys", "-t", session_name, "C-u"], check=True)
+                subprocess.run(["tmux", "load-buffer", str(temp_path)], check=True)
+                subprocess.run(["tmux", "paste-buffer", "-p", "-t", session_name], check=True)
+                subprocess.run(["tmux", "send-keys", "-t", session_name, "Enter"], check=True)
+            finally:
+                temp_path.unlink(missing_ok=True)
 
     def dismiss_claude_feedback_prompt_if_visible(
         self,

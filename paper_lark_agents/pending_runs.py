@@ -149,6 +149,27 @@ class PendingRunStore:
             (self.claim_dir / safe_filename(run_id)).unlink(missing_ok=True)
         return removed
 
+    def clear_stale_cards(self) -> int:
+        """Clear card_id and status_message_id from all pending runs.
+
+        Streaming cards die on bridge restart (10-min Feishu timeout),
+        so stale card references cause infinite update failures. The
+        pending run worker will create fresh cards on the next poll.
+        """
+        with self._locked():
+            records = self._read_records_unlocked()
+            changed = 0
+            for r in records:
+                if r.get("type") != "run":
+                    continue
+                if r.get("card_id") or r.get("status_message_id"):
+                    r["card_id"] = ""
+                    r["status_message_id"] = ""
+                    changed += 1
+            if changed:
+                self._write_records_unlocked(records)
+        return changed
+
     def compact(self) -> int:
         cutoff = time.time() - self.ttl_seconds
         with self._locked():

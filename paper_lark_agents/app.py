@@ -241,6 +241,9 @@ class PaperAgentBridge:
         removed = self.pending_runs.compact()
         if removed:
             LOGGER.info("compacted %d expired/completed pending run records", removed)
+        stale = self.pending_runs.clear_stale_cards()
+        if stale:
+            LOGGER.info("cleared %d stale card references from pending runs", stale)
         self._recover_orphaned_sessions()
         stop_workers = threading.Event()
         handoff_worker = self.start_handoff_worker(stop_workers)

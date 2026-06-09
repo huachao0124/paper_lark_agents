@@ -2105,13 +2105,25 @@ class PaperAgentBridge:
                 if not isinstance(cursor_val, list) or len(cursor_val) != 2:
                     continue
                 path_str = str(cursor_val[0])
-                # Always use file-end offset for recovery — old replies
-                # were likely already delivered before the restart. The
-                # pending run worker will detect any NEW replies going forward.
                 try:
-                    offset = Path(path_str).stat().st_size if Path(path_str).exists() else 0
+                    file_size = Path(path_str).stat().st_size if Path(path_str).exists() else 0
                 except OSError:
-                    offset = 0
+                    file_size = 0
+                # Check if the session is idle (at prompt, no work in progress).
+                # If idle and cursor is at file end, the agent finished before
+                # the restart — nothing to recover.
+                try:
+                    from .tmux_runtime import session_ready_for_input
+                    screen = runtime.capture(session_name)
+                    tail_lines = [l for l in screen.splitlines() if l.strip()]
+                    tail = "\n".join(tail_lines[-12:])
+                    idle = session_ready_for_input(tail, agent)
+                except Exception:
+                    idle = False
+                if idle:
+                    LOGGER.info("skipping idle %s session %s for chat %s", agent, session_name, chat_id)
+                    continue
+                offset = file_size
                 run_id = uuid.uuid4().hex
                 start_marker, end_marker = runtime.reply_markers(run_id)
                 runtime.store_run_cursor(session_name, run_id, path_str, offset)

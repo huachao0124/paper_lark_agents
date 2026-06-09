@@ -435,7 +435,16 @@ class PaperAgentBridge:
         return time.time() > run.created_at + max(1, timeout)
 
     def update_recovered_status(self, run: PendingRun, card: TurnCard | None) -> None:
-        if not card or not card.message_id:
+        if not card:
+            return
+        # Cache the card so streaming renewals persist across polls.
+        card_key = f"{card.agent}:{card.chat_id}"
+        cached = self._active_turn_cards.get(card_key)
+        if cached and cached.message_id:
+            card = cached
+        elif card.message_id:
+            self._active_turn_cards[card_key] = card
+        if not card.message_id:
             return
         interval = max(1, self.settings.status_update_seconds)
         last = self._pending_status_updates.get(run.run_id, 0.0)

@@ -655,6 +655,7 @@ class TmuxSessionRuntime:
 
     def paste_and_submit(self, session_name: str, text: str) -> None:
         self.dismiss_claude_feedback_prompt_if_visible(session_name)
+        LOGGER.info("paste_and_submit to %s (%d chars)", session_name, len(text))
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
             handle.write(text)
             temp_path = Path(handle.name)

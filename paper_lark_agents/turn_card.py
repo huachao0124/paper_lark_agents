@@ -38,6 +38,7 @@ class TurnCardManager:
         self._lock = threading.Lock()
         self._active: dict[str, TurnCard] = {}
         self._accumulated: dict[str, str] = {}
+        self._creating: set[str] = set()
 
     @staticmethod
     def _key(agent: str, chat_id: str) -> str:
@@ -56,8 +57,6 @@ class TurnCardManager:
             self._active.clear()
             self._accumulated.clear()
         return count
-
-    _creating: set[str] = set()
 
     def acquire(
         self,
@@ -311,9 +310,13 @@ class TurnCardManager:
             if hasattr(self._lark, '_client'):
                 from lark_oapi.api.im.v1 import DeleteMessageRequest
                 req = DeleteMessageRequest.builder().message_id(message_id).build()
-                self._lark._client.im.v1.message.delete(req)
-        except Exception:
-            pass
+                resp = self._lark._client.im.v1.message.delete(req)
+                if resp.success():
+                    LOGGER.info("deleted message %s", message_id[:16])
+                else:
+                    LOGGER.warning("delete message %s failed: %s", message_id[:16], resp.msg)
+        except Exception as exc:
+            LOGGER.warning("delete message %s error: %s", message_id[:16], exc)
 
     def _footer(self, card: TurnCard) -> str:
         elapsed = max(0, int(time.time() - card.started_at))

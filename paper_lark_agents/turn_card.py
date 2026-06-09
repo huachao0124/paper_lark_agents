@@ -76,6 +76,7 @@ class TurnCardManager:
                     return None
                 self._active.pop(key, None)
         if old and force:
+            LOGGER.info("interrupting old card %s for %s", old.message_id[:12], key)
             self._interrupt_card(old)
         if strategy == "auto":
             strategy = "streaming" if self._supports_streaming() else "plain"
@@ -281,6 +282,8 @@ class TurnCardManager:
                 return
             except Exception:
                 pass
+        # Finalize failed or not streaming — delete the message.
+        self._delete_message(card.message_id)
         self._delete_message(card.message_id)
 
     def _delete_message(self, message_id: str) -> None:

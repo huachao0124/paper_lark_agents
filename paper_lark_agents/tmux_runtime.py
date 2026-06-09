@@ -408,9 +408,23 @@ class TmuxSessionRuntime:
         data.pop("transcript_path", None)
         data.pop("session_uuid", None)
         data.pop("session_prompt_version", None)
+        data.pop("run_cursors", None)
         path = self.metadata_path(session_name)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def list_matching_sessions(self) -> list[str]:
+        prefix = f"pla-{self.session_id}-"
+        proc = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            text=True, capture_output=True, check=False,
+        )
+        if proc.returncode != 0:
+            return []
+        return [
+            name.strip() for name in proc.stdout.splitlines()
+            if name.strip().startswith(prefix)
+        ]
 
     def kill_session(self, session_name: str) -> None:
         subprocess.run(["tmux", "kill-session", "-t", session_name], check=False)

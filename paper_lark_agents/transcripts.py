@@ -134,8 +134,10 @@ def claude_followup_from_lines(lines: list[dict]) -> TurnResult | None:
     if last.get("stop_reason") not in CLAUDE_TERMINAL_STOP_REASONS and not dispatched:
         # Not terminal, but if there is substantive text (e.g. a progress
         # report before a /loop timer tool_use), deliver it anyway.
+        # Require enough text to avoid partial/fragment false deliveries.
+        text_bearing = [m for m in messages if _claude_message_text(m)]
         text = "\n\n".join(t for m in messages if (t := _claude_message_text(m))).strip()
-        if text and len(text) > 20:
+        if text and len(text) > 100 and len(text_bearing) >= 1:
             usage = last.get("usage") if isinstance(last.get("usage"), dict) else None
             return TurnResult(text=text, usage=usage)
         return None

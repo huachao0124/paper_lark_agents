@@ -149,6 +149,30 @@ class PendingRunStore:
             (self.claim_dir / safe_filename(run_id)).unlink(missing_ok=True)
         return removed
 
+    def compact(self) -> int:
+        cutoff = time.time() - self.ttl_seconds
+        with self._locked():
+            records = self._read_records_unlocked()
+            done_ids = {
+                str(r.get("run_id") or "")
+                for r in records if r.get("type") in {"done", "failed"}
+            }
+            kept: list[dict[str, Any]] = []
+            removed = 0
+            for r in records:
+                created = float(r.get("created_at") or 0)
+                if created < cutoff:
+                    removed += 1
+                    continue
+                run_id = str(r.get("run_id") or "")
+                if r.get("type") == "run" and run_id in done_ids:
+                    removed += 1
+                    continue
+                kept.append(r)
+            if removed:
+                self._write_records_unlocked(kept)
+        return removed
+
     def _append(self, record: dict[str, object]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(record, ensure_ascii=False)

@@ -238,6 +238,10 @@ class PaperAgentBridge:
     def serve(self) -> None:
         self._load_chat_names()
         self._load_followup_cursors()
+        removed = self.pending_runs.compact()
+        if removed:
+            LOGGER.info("compacted %d expired/completed pending run records", removed)
+        self._recover_orphaned_sessions()
         stop_workers = threading.Event()
         handoff_worker = self.start_handoff_worker(stop_workers)
         pending_worker = self.start_pending_run_worker(stop_workers)
@@ -1990,6 +1994,64 @@ class PaperAgentBridge:
                     self._followup_cursors.setdefault(key, value)
             LOGGER.info("restored %d followup cursor(s) from disk", len(restored))
 
+    def _recover_orphaned_sessions(self) -> None:
+        for agent in self.pending_run_agents():
+            runtime = self.agents.codex_session if agent == "codex" else self.agents.claude_session
+            live = runtime.list_matching_sessions()
+            for session_name in live:
+                meta = runtime.read_metadata(session_name)
+                chat_id = str(meta.get("chat_id") or "")
+                if not chat_id:
+                    continue
+                key = f"{agent}:{chat_id}"
+                if key in self._followup_cursors:
+                    continue
+                existing = self.pending_runs.pending_for(agent)
+                if any(r.chat_id == chat_id for r in existing):
+                    continue
+                if runtime._cli_crashed(session_name):
+                    continue
+                cursors = meta.get("run_cursors")
+                if not isinstance(cursors, dict) or not cursors:
+                    continue
+                last_run_id = list(cursors.keys())[-1]
+                cursor_val = cursors[last_run_id]
+                if not isinstance(cursor_val, list) or len(cursor_val) != 2:
+                    continue
+                path_str, offset = str(cursor_val[0]), int(cursor_val[1])
+                reply = runtime.read_jsonl_reply(path_str, offset)
+                from .tmux_runtime import session_tail_busy
+                try:
+                    screen = runtime.capture(session_name)
+                    still_busy = session_tail_busy(screen)
+                except Exception:
+                    still_busy = False
+                if not reply and not still_busy:
+                    continue
+                run_id = uuid.uuid4().hex
+                start_marker, end_marker = runtime.reply_markers(run_id)
+                runtime.store_run_cursor(session_name, run_id, path_str, offset)
+                self.pending_runs.start(
+                    run_id=run_id, chat_id=chat_id, agent=agent,
+                    route_text="(recovered after restart)",
+                    session_name=session_name,
+                    workspace=str(meta.get("workspace", "")),
+                    start_marker=start_marker, end_marker=end_marker,
+                    status_message_id=None, card_id=None,
+                    timeout=self.agent_timeout(agent),
+                    event_id="", message_id="", sender_id="",
+                    message_type="text", chat_type="group",
+                    event_content="", source_agent=None,
+                    handoff_depth=0,
+                    model_label=self.chat_model_label(chat_id, agent),
+                    effort_label=self.chat_effort_label(chat_id, agent),
+                )
+                LOGGER.info(
+                    "recovered orphaned %s session %s for chat %s (%s)",
+                    agent, session_name, chat_id,
+                    "reply ready" if reply else "still running",
+                )
+
     def start_followup_worker(self, stop_event: threading.Event) -> threading.Thread | None:
         if self.default_agent != "claude":
             return None
@@ -2025,26 +2087,26 @@ class PaperAgentBridge:
                 _, _, seq, started_at = followup_cards[key]
                 if time.time() - started_at < 570:
                     continue
-                    card_id, msg_id, seq, started_at = followup_cards.pop(key)
-                    acc = followup_texts.pop(key, "")
-                    followup_idle.pop(key, None)
-                    agent = key.split(":", 1)[0]
-                    if self._supports_streaming_cards() and card_id:
-                        footer = self._turn_card_footer(TurnCard(
-                            msg_id, "", agent, self.agent_display_name(agent),
-                            self.chat_model_label(snapshot[key][2].chat_id, agent),
-                            self.chat_effort_label(snapshot[key][2].chat_id, agent),
-                            started_at,
-                        ))
-                        try:
-                            self.lark.finalize_streaming_card(
-                                card_id, final_content=acc,
-                                title=f"{self.agent_display_name(agent)} · Done",
-                                sequence=seq + 1, footer=footer,
-                            )
-                        except LarkCLIError:
-                            pass
-                    LOGGER.info("follow-up card finalized for %s", key)
+                card_id, msg_id, seq, started_at = followup_cards.pop(key)
+                acc = followup_texts.pop(key, "")
+                followup_idle.pop(key, None)
+                agent = key.split(":", 1)[0]
+                if self._supports_streaming_cards() and card_id:
+                    footer = self._turn_card_footer(TurnCard(
+                        msg_id, "", agent, self.agent_display_name(agent),
+                        self.chat_model_label(snapshot[key][2].chat_id, agent),
+                        self.chat_effort_label(snapshot[key][2].chat_id, agent),
+                        started_at,
+                    ))
+                    try:
+                        self.lark.finalize_streaming_card(
+                            card_id, final_content=acc,
+                            title=f"{self.agent_display_name(agent)} · Done",
+                            sequence=seq + 1, footer=footer,
+                        )
+                    except LarkCLIError:
+                        pass
+                LOGGER.info("follow-up card finalized for %s (9.5min timeout)", key)
             for key, (path, cur, event, route, source_agent, depth) in snapshot.items():
                 try:
                     text, new_cur = self.agents.claude_session.poll_followup_reply(path, cur, timeout=0)

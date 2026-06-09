@@ -221,23 +221,27 @@ class PaperAgentBridge:
         self._followup_lock = threading.Lock()
 
     def serve(self) -> None:
-        self._load_chat_names()
         self._load_followup_cursors()
-        removed = self.pending_runs.compact()
-        if removed:
-            LOGGER.info("compacted %d expired/completed pending run records", removed)
-        stale = self.pending_runs.clear_stale_cards()
-        if stale:
-            LOGGER.info("cleared %d stale card references from pending runs", stale)
+        self.pending_runs.compact()
+        self.pending_runs.clear_stale_cards()
         self.cards.clear_all()
+        stop_workers = threading.Event()
+        # Start event consumption FIRST so no messages are lost during cleanup.
+        event_thread = threading.Thread(
+            target=self._consume_events_safe,
+            name="pla-events",
+            daemon=True,
+        )
+        event_thread.start()
+        # Background cleanup and recovery after WebSocket is up.
+        self._load_chat_names()
         self._cleanup_stale_running_cards()
         self._recover_orphaned_sessions()
-        stop_workers = threading.Event()
         handoff_worker = self.start_handoff_worker(stop_workers)
         pending_worker = self.start_pending_run_worker(stop_workers)
         followup_worker = self.start_followup_worker(stop_workers)
         try:
-            self.lark.consume_events(self.handle_lark_event)
+            event_thread.join()
         finally:
             stop_workers.set()
             if handoff_worker:
@@ -246,6 +250,12 @@ class PaperAgentBridge:
                 pending_worker.join(timeout=2)
             if followup_worker:
                 followup_worker.join(timeout=2)
+
+    def _consume_events_safe(self) -> None:
+        try:
+            self.lark.consume_events(self.handle_lark_event)
+        except Exception:
+            LOGGER.exception("event consumer died")
 
     def _load_chat_names(self) -> None:
         """Query Feishu for group names and register them with the session runtimes."""

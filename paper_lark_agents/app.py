@@ -371,28 +371,26 @@ class PaperAgentBridge:
                     LOGGER.info("pending run %s timed out after %.0fs (agent idle)", run.run_id, age)
                     return
             if not card and self.settings.send_progress:
-                card = self.start_turn_card(
-                    run.chat_id, run.agent,
-                    run.model_label or self.chat_model_label(run.chat_id, run.agent),
-                    run.effort_label or self.chat_effort_label(run.chat_id, run.agent),
+                # Use a plain card (not streaming) for pending run progress —
+                # streaming cards time out after 10 min, but agents can run for hours.
+                agent_name = self.agent_display_name(run.agent)
+                plain = turn_reply_card(agent_name, "running", "仍在处理…",
+                    model=run.model_label or self.chat_model_label(run.chat_id, run.agent),
+                    effort=run.effort_label or self.chat_effort_label(run.chat_id, run.agent),
+                    started_at=time.time(),
                 )
-                if card:
-                    self.pending_runs.mark_done(run.run_id, status="upgraded")
-                    new_run_id = uuid.uuid4().hex
-                    self.pending_runs.start(
-                        run_id=new_run_id, chat_id=run.chat_id, agent=run.agent,
-                        route_text=run.route_text, event_id=run.event_id,
-                        message_id=run.message_id, sender_id=run.sender_id,
-                        message_type=run.message_type, chat_type=run.chat_type,
-                        event_content=run.event_content, source_agent=run.source_agent,
-                        handoff_depth=run.handoff_depth,
-                        start_marker=run.start_marker, end_marker=run.end_marker,
-                        session_name=run.session_name, workspace=run.workspace,
-                        status_message_id=card.message_id,
-                        card_id=card.card_id,
-                        model_label=card.model, effort_label=card.effort,
-                        timeout=run.timeout,
-                    )
+                try:
+                    result = self.lark.send_card(run.chat_id, plain)
+                    msg_id = first_field(result, "message_id") or first_field(result, "id")
+                    if msg_id:
+                        card = TurnCard(str(msg_id), run.chat_id, run.agent, agent_name,
+                            run.model_label or self.chat_model_label(run.chat_id, run.agent),
+                            run.effort_label or self.chat_effort_label(run.chat_id, run.agent),
+                            time.time())
+                        card_key = f"{run.agent}:{run.chat_id}"
+                        self._active_turn_cards[card_key] = card
+                except LarkCLIError as exc:
+                    LOGGER.warning("pending run card create failed: %s", exc)
             self.update_recovered_status(run, card)
             return
         if not self.pending_runs.claim(run.run_id):

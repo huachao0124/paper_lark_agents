@@ -88,8 +88,21 @@ class TurnCardManager:
         return card
 
     def update(self, card: TurnCard, detail: str) -> None:
-        if not card or not card.message_id:
+        if not card:
             return
+        if not card.message_id:
+            new = self._create_card(
+                card.chat_id, card.agent, card.agent_name,
+                card.model, card.effort, "plain",
+            )
+            if new:
+                with self._lock:
+                    card.message_id = new.message_id
+                    card.strategy = "plain"
+                    card.card_id = None
+                LOGGER.info("recovered dead card for %s:%s", card.agent, card.chat_id)
+            else:
+                return
         with self._lock:
             card.sequence += 1
             seq = card.sequence

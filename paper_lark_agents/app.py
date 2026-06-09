@@ -2078,24 +2078,13 @@ class PaperAgentBridge:
                 if not isinstance(cursor_val, list) or len(cursor_val) != 2:
                     continue
                 path_str = str(cursor_val[0])
-                from .tmux_runtime import session_tail_busy, session_ready_for_current_input
+                # Always use file-end offset for recovery — old replies
+                # were likely already delivered before the restart. The
+                # pending run worker will detect any NEW replies going forward.
                 try:
-                    screen = runtime.capture(session_name)
-                    still_busy = not session_ready_for_current_input(screen, agent)
-                except Exception:
-                    still_busy = True
-                if still_busy:
-                    # Agent still working — set cursor to file end so we
-                    # only detect NEW replies, not old already-delivered ones.
-                    try:
-                        offset = Path(path_str).stat().st_size if Path(path_str).exists() else 0
-                    except OSError:
-                        offset = 0
-                else:
-                    offset = int(cursor_val[1])
-                    reply = runtime.read_jsonl_reply(path_str, offset)
-                    if not reply:
-                        continue
+                    offset = Path(path_str).stat().st_size if Path(path_str).exists() else 0
+                except OSError:
+                    offset = 0
                 run_id = uuid.uuid4().hex
                 start_marker, end_marker = runtime.reply_markers(run_id)
                 runtime.store_run_cursor(session_name, run_id, path_str, offset)
@@ -2115,9 +2104,8 @@ class PaperAgentBridge:
                     effort_label=self.chat_effort_label(chat_id, agent),
                 )
                 LOGGER.info(
-                    "recovered orphaned %s session %s for chat %s (%s)",
+                    "recovered orphaned %s session %s for chat %s (watching for new replies)",
                     agent, session_name, chat_id,
-                    "reply ready" if reply else "still running",
                 )
 
     def start_followup_worker(self, stop_event: threading.Event) -> threading.Thread | None:

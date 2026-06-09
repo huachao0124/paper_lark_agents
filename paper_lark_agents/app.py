@@ -1849,10 +1849,36 @@ class PaperAgentBridge:
                     )
             except LarkCLIError as exc:
                 LOGGER.warning("streaming card update failed for %s: %s", card.card_id, exc)
-                # Streaming mode may have auto-closed (10 min timeout) or
-                # sequence diverged. Fall back to regular card update.
+                if state == "running":
+                    # Streaming timed out mid-turn. Create a fresh streaming
+                    # card to continue showing progress.
+                    try:
+                        new_card_id = self.lark.create_streaming_card(f"{card.agent_name} · Running")
+                        new_msg_id = self.lark.send_streaming_card(card.chat_id, new_card_id)
+                        card.card_id = new_card_id
+                        card.message_id = new_msg_id
+                        card.sequence = 1
+                        card.started_at = time.time()
+                        self.lark.stream_card_content(new_card_id, body, sequence=1)
+                        return True
+                    except LarkCLIError:
+                        pass
+                # For terminal states (done/failed), send a new plain card.
                 card.card_id = None
-                return self._render_turn_card(card, state, body)
+                card.message_id = ""
+                done_card = turn_reply_card(
+                    card.agent_name, state, body,
+                    model=card.model, effort=card.effort, started_at=card.started_at,
+                )
+                try:
+                    result = self.lark.send_card(card.chat_id, done_card)
+                    msg_id = first_field(result, "message_id")
+                    if msg_id:
+                        card.message_id = str(msg_id)
+                    return True
+                except LarkCLIError as exc2:
+                    LOGGER.warning("fallback card send failed: %s", exc2)
+                    return False
             return True
         rendered = turn_reply_card(
             card.agent_name, state, body, model=card.model, effort=card.effort, started_at=card.started_at

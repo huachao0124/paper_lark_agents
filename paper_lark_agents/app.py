@@ -1880,11 +1880,14 @@ class PaperAgentBridge:
             except LarkCLIError as exc:
                 LOGGER.warning("streaming card update failed for %s: %s", card.card_id, exc)
                 if state == "running":
-                    # Streaming timed out mid-turn. Create a fresh streaming
-                    # card to continue showing progress.
+                    # Streaming timed out mid-turn. Delete the dead card and
+                    # create a fresh streaming card to continue.
+                    old_msg_id = card.message_id
                     try:
                         new_card_id = self.lark.create_streaming_card(f"{card.agent_name} · Running")
                         new_msg_id = self.lark.send_streaming_card(card.chat_id, new_card_id)
+                        if old_msg_id:
+                            self._delete_stuck_card(old_msg_id)
                         card.card_id = new_card_id
                         card.message_id = new_msg_id
                         card.sequence = 1
@@ -1893,9 +1896,13 @@ class PaperAgentBridge:
                         return True
                     except LarkCLIError:
                         pass
-                # For terminal states (done/failed), send a new plain card.
+                # For terminal states (done/failed), delete the stuck Running
+                # card and send a fresh Done card.
+                old_msg_id = card.message_id
                 card.card_id = None
                 card.message_id = ""
+                if old_msg_id:
+                    self._delete_stuck_card(old_msg_id)
                 done_card = turn_reply_card(
                     card.agent_name, state, body,
                     model=card.model, effort=card.effort, started_at=card.started_at,
@@ -1921,6 +1928,23 @@ class PaperAgentBridge:
                 card.message_id = ""
             return False
         return True
+
+    def _delete_stuck_card(self, message_id: str) -> None:
+        try:
+            if hasattr(self.lark, '_client'):
+                from lark_oapi.api.im.v1 import DeleteMessageRequest
+                req = DeleteMessageRequest.builder().message_id(message_id).build()
+                self.lark._client.im.v1.message.delete(req)
+            else:
+                import subprocess
+                cmd = [self.settings.lark_cli]
+                if self.settings.lark_profile:
+                    cmd.extend(["--profile", self.settings.lark_profile])
+                cmd.extend(["im", "messages", "delete", "--as", "bot", "--yes",
+                            "--params", json.dumps({"message_id": message_id})])
+                subprocess.run(cmd, capture_output=True, check=False)
+        except Exception as exc:
+            LOGGER.debug("failed to delete stuck card %s: %s", message_id, exc)
 
     def _turn_card_footer(self, card: TurnCard) -> str:
         elapsed = max(0, int(time.time() - card.started_at))

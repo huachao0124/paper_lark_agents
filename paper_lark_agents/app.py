@@ -229,6 +229,7 @@ class PaperAgentBridge:
         self.pending_runs.compact()
         self.pending_runs.clear_stale_cards()
         self.cards.clear_all()
+        self._clear_stale_claims()
         stop_workers = threading.Event()
         # Start event consumption FIRST so no messages are lost during cleanup.
         event_thread = threading.Thread(
@@ -254,6 +255,20 @@ class PaperAgentBridge:
                 pending_worker.join(timeout=2)
             if followup_worker:
                 followup_worker.join(timeout=2)
+
+    def _clear_stale_claims(self) -> None:
+        for claim_dir in [
+            self.settings.state_dir / "agent_handoff_claims",
+            self.settings.state_dir / "pending_run_claims",
+        ]:
+            if not claim_dir.exists():
+                continue
+            count = 0
+            for f in claim_dir.iterdir():
+                f.unlink(missing_ok=True)
+                count += 1
+            if count:
+                LOGGER.info("cleared %d stale claims from %s", count, claim_dir.name)
 
     def _consume_events_safe(self) -> None:
         try:

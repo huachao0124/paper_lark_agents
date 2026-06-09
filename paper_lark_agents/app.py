@@ -230,6 +230,7 @@ class PaperAgentBridge:
         if stale:
             LOGGER.info("cleared %d stale card references from pending runs", stale)
         self.cards.clear_all()
+        self._cleanup_stale_running_cards()
         self._recover_orphaned_sessions()
         stop_workers = threading.Event()
         handoff_worker = self.start_handoff_worker(stop_workers)
@@ -1888,6 +1889,59 @@ class PaperAgentBridge:
                 for key, value in restored.items():
                     self._followup_cursors.setdefault(key, value)
             LOGGER.info("restored %d followup cursor(s) from disk", len(restored))
+
+    def _cleanup_stale_running_cards(self) -> None:
+        """On startup, delete any Running cards left by a previous bridge process.
+
+        These cards are dead — streaming expired, message_id can't be reused.
+        The pending_run_loop will create fresh cards as needed.
+        """
+        if not hasattr(self.lark, '_client'):
+            return
+        try:
+            chats = self.lark.list_chats()
+        except Exception:
+            return
+        import lark_oapi as lark
+        from lark_oapi.api.im.v1 import DeleteMessageRequest
+        total = 0
+        for chat in chats:
+            chat_id = chat.get("chat_id", "")
+            if not chat_id:
+                continue
+            if self.settings.chat_id and chat_id != self.settings.chat_id:
+                continue
+            try:
+                request = (
+                    lark.BaseRequest.builder()
+                    .http_method(lark.HttpMethod.GET)
+                    .uri("/open-apis/im/v1/messages")
+                    .token_types({lark.AccessTokenType.TENANT})
+                    .queries([
+                        ("container_id_type", "chat"),
+                        ("container_id", chat_id),
+                        ("page_size", "20"),
+                        ("sort_type", "ByCreateTimeDesc"),
+                    ])
+                    .build()
+                )
+                resp = self.lark._client.request(request)
+                import json
+                data = json.loads(resp.raw.content.decode())
+                for m in data.get("data", {}).get("items", []):
+                    sender = m.get("sender", {})
+                    if sender.get("sender_type") != "app":
+                        continue
+                    content = m.get("body", {}).get("content", "") or ""
+                    if "Running" in content:
+                        req = DeleteMessageRequest.builder().message_id(m["message_id"]).build()
+                        r = self.lark._client.im.v1.message.delete(req)
+                        if r.success():
+                            total += 1
+            except Exception:
+                continue
+        if total:
+            LOGGER.info("cleaned up %d stale Running cards from previous process", total)
 
     def _recover_orphaned_sessions(self) -> None:
         for agent in self.pending_run_agents():

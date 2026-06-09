@@ -219,6 +219,10 @@ class PaperAgentBridge:
         # to watch for additional end_turn messages after the first reply.
         self._followup_cursors: dict[str, tuple[str, int, MessageEvent, Route, str | None, int]] = {}
         self._followup_lock = threading.Lock()
+        # Interactive prompt state: agent:chat_id -> last detected prompt hash.
+        # Used to avoid re-sending the same prompt and to intercept replies.
+        self._interactive_prompts: dict[str, str] = {}  # key -> prompt hash
+        self._interactive_sessions: dict[str, str] = {}  # chat_id -> session_name
 
     def serve(self) -> None:
         self._load_followup_cursors()
@@ -446,7 +450,7 @@ class PaperAgentBridge:
             pass
         if not detail:
             detail = self.agents.session_progress(run.agent, run.chat_id) or "仍在处理,完成后这张卡会更新成回复…"
-        # Check tmux screen for errors the agent can't recover from.
+        # Check tmux screen for errors and interactive prompts.
         try:
             runtime = self.agents.codex_session if run.agent == "codex" else self.agents.claude_session
             session_name = runtime.session_name(run.chat_id)
@@ -454,6 +458,7 @@ class PaperAgentBridge:
             error = _detect_screen_error(screen)
             if error:
                 detail = f"⚠️ {error}\n\n{detail}"
+            self._check_interactive_prompt(run.agent, run.chat_id, session_name, screen)
         except Exception:
             pass
         self.cards.update(card, detail)
@@ -631,6 +636,13 @@ class PaperAgentBridge:
             LOGGER.warning("inbound attachment download failed for %s: %s", event.message_id, exc)
             self.send_progress_markdown(event.chat_id, f"Attachment download failed: {exc}")
             return
+
+        # Intercept replies to interactive prompts (e.g., "1", "2", "esc").
+        if event.chat_id in self._interactive_sessions:
+            tmux_key = _is_interactive_reply(event.content)
+            if tmux_key:
+                self._handle_interactive_reply(event, tmux_key)
+                return
 
         try:
             route = route_message(
@@ -1910,6 +1922,60 @@ class PaperAgentBridge:
                     self._followup_cursors.setdefault(key, value)
             LOGGER.info("restored %d followup cursor(s) from disk", len(restored))
 
+    def _check_interactive_prompt(
+        self, agent: str, chat_id: str, session_name: str, screen: str,
+    ) -> None:
+        from .interactive import detect_interactive_prompt, format_prompt_message
+        prompt = detect_interactive_prompt(screen)
+        if not prompt:
+            key = f"{agent}:{chat_id}"
+            self._interactive_prompts.pop(key, None)
+            self._interactive_sessions.pop(chat_id, None)
+            return
+        prompt_hash = str(hash(tuple(prompt["options"])))
+        key = f"{agent}:{chat_id}"
+        if self._interactive_prompts.get(key) == prompt_hash:
+            return
+        self._interactive_prompts[key] = prompt_hash
+        self._interactive_sessions[chat_id] = session_name
+        msg = format_prompt_message(prompt)
+        LOGGER.info("interactive prompt detected in %s for %s", session_name, chat_id)
+        self.send_progress_markdown(chat_id, msg)
+
+    def _handle_interactive_reply(
+        self, event: MessageEvent, tmux_key: str,
+    ) -> bool:
+        session_name = self._interactive_sessions.get(event.chat_id)
+        if not session_name:
+            return False
+        import subprocess
+        try:
+            if tmux_key == "Escape":
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", session_name, "Escape"],
+                    text=True, capture_output=True, check=True,
+                )
+            else:
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", session_name, tmux_key],
+                    text=True, capture_output=True, check=True,
+                )
+                time.sleep(0.3)
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", session_name, "Enter"],
+                    text=True, capture_output=True, check=True,
+                )
+            self._interactive_sessions.pop(event.chat_id, None)
+            for k in list(self._interactive_prompts):
+                if k.endswith(f":{event.chat_id}"):
+                    self._interactive_prompts.pop(k, None)
+            self.send_progress_markdown(event.chat_id, f"已选择: {tmux_key}")
+            LOGGER.info("forwarded interactive reply '%s' to %s", tmux_key, session_name)
+            return True
+        except Exception as exc:
+            LOGGER.warning("failed to forward interactive reply: %s", exc)
+            return False
+
     def _cleanup_stale_running_cards(self) -> None:
         """On startup, delete any Running cards left by a previous bridge process.
 
@@ -2474,6 +2540,18 @@ class PaperAgentBridge:
         stripped = reply.strip()
         token = self.settings.no_reply_token
         return stripped == token or stripped.startswith(token + " ") or stripped.startswith(token + "—") or stripped.startswith(token + "\n")
+
+
+def _is_interactive_reply(text: str) -> str | None:
+    """Check if a message is a reply to an interactive prompt.
+    Returns the key to send to tmux, or None."""
+    stripped = text.strip().lower()
+    if stripped in {"esc", "cancel", "取消"}:
+        return "Escape"
+    m = re.match(r"^(\d+)$", stripped)
+    if m:
+        return m.group(1)
+    return None
 
 
 _SCREEN_ERROR_PATTERNS = [

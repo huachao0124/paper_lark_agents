@@ -198,13 +198,18 @@ class TmuxSessionRuntime:
     ) -> bool:
         command = self.command(workspace, model=model, effort=effort)
         if self.session_exists(session_name):
-            ws_match = self.session_workspace_matches(session_name, workspace)
-            cmd_match = self.session_command_matches(session_name, command)
-            if ws_match and cmd_match:
-                self.configure_window_size(session_name)
-                self.ensure_transcript_pipe(session_name)
-                self.refresh_detected_session_labels(session_name)
-                return not self.session_initialized(session_name)
+            if self._cli_crashed(session_name):
+                LOGGER.warning("CLI crashed in %s, recreating session", session_name)
+                self.kill_session(session_name)
+                self._clear_stale_transcript(session_name)
+            else:
+                ws_match = self.session_workspace_matches(session_name, workspace)
+                cmd_match = self.session_command_matches(session_name, command)
+                if ws_match and cmd_match:
+                    self.configure_window_size(session_name)
+                    self.ensure_transcript_pipe(session_name)
+                    self.refresh_detected_session_labels(session_name)
+                    return not self.session_initialized(session_name)
             # Only workspace changed (model/effort/args unchanged) — try to
             # preserve the agent's conversation context.
             only_workspace_changed = not ws_match and self._command_matches_ignoring_workspace(session_name, command)
@@ -378,6 +383,34 @@ class TmuxSessionRuntime:
         if not isinstance(recorded, list):
             return True
         return without_existing_cwd_args(tuple(str(s) for s in recorded)) == without_existing_cwd_args(tuple(str(s) for s in command))
+
+    def _cli_crashed(self, session_name: str) -> bool:
+        try:
+            screen = self.capture(session_name)
+        except subprocess.CalledProcessError:
+            return False
+        lines = [l.strip() for l in screen.splitlines() if l.strip()]
+        if not lines:
+            return False
+        tail = "\n".join(lines[-6:])
+        if session_ready_for_input(tail, self.agent):
+            return False
+        if session_tail_busy(tail):
+            return False
+        has_bash = bool(re.search(r"\$\s*$|bash.*command not found", tail))
+        has_cli = "❯" in tail or "›" in tail or "esc to interrupt" in tail
+        return has_bash and not has_cli
+
+    def _clear_stale_transcript(self, session_name: str) -> None:
+        data = self.read_metadata(session_name)
+        if not data:
+            return
+        data.pop("transcript_path", None)
+        data.pop("session_uuid", None)
+        data.pop("session_prompt_version", None)
+        path = self.metadata_path(session_name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def kill_session(self, session_name: str) -> None:
         subprocess.run(["tmux", "kill-session", "-t", session_name], check=False)

@@ -886,6 +886,7 @@ class TmuxSessionRuntime:
     def wait_for_session_ready(self, session_name: str) -> None:
         deadline = time.time() + max(1.0, self.settings.session_startup_wait)
         last_capture = ""
+        resume_dismissed = False
         while time.time() < deadline:
             try:
                 last_capture = self.capture(session_name)
@@ -894,6 +895,16 @@ class TmuxSessionRuntime:
                 continue
             if session_ready_for_input(last_capture, self.agent):
                 return
+            # Claude --resume on large sessions shows a dialog asking whether to
+            # resume from summary (1) or full (2). Auto-select "2. Resume full
+            # session as-is" so the bridge never stalls on the picker.
+            if not resume_dismissed and "Resume full session as-is" in last_capture:
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", session_name, "Down", "Enter"],
+                    text=True, capture_output=True, check=False,
+                )
+                resume_dismissed = True
+                LOGGER.info("auto-selected 'Resume full session' for %s", session_name)
             time.sleep(0.5)
         if last_capture:
             return

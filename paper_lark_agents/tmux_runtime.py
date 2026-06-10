@@ -291,10 +291,11 @@ class TmuxSessionRuntime:
             self.store_session_uuid(session_name, keep_uuid)
         self.ensure_transcript_pipe(session_name)
         self.wait_for_session_ready(session_name)
-        if resume_uuid and self.agent == "claude":
-            # The resume picker may render a beat after the UI is ready.
+        if self.agent == "claude":
+            # Launch dialogs (folder trust, late resume picker) may render a
+            # beat after the UI is ready.
             for _ in range(4):
-                if self.dismiss_claude_resume_prompt_if_visible(session_name):
+                if self.auto_confirm_prompt_if_visible(session_name):
                     break
                 time.sleep(0.5)
         self.refresh_detected_session_labels(session_name)
@@ -697,9 +698,9 @@ class TmuxSessionRuntime:
     def paste_and_submit(self, session_name: str, text: str) -> None:
         with self._session_lock(session_name):
             self.dismiss_claude_feedback_prompt_if_visible(session_name)
-            if self.dismiss_claude_resume_prompt_if_visible(session_name):
-                # Give the resumed session a moment to load before pasting,
-                # so the message lands in the input box, not the menu.
+            if self.auto_confirm_prompt_if_visible(session_name):
+                # Give the session a moment to settle before pasting, so the
+                # message lands in the input box, not in a menu.
                 time.sleep(2)
             LOGGER.info("paste_and_submit to %s (%d chars)", session_name, len(text))
             with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
@@ -735,39 +736,52 @@ class TmuxSessionRuntime:
         )
         return True
 
-    _RESUME_PROMPT_MARKERS = ("Resume from summary", "Resume full session")
+    # Blocking confirm dialogs that unattended sessions auto-answer with
+    # their first/default option. The resume picker is handled separately:
+    # wait_for_session_ready selects "Resume full session as-is".
+    _CONFIRM_DIALOG_MARKERS = (
+        "Yes, switch to",            # claude /model & /effort confirmation
+        "Yes, I trust this folder",  # claude workspace trust prompt
+        "Press enter to confirm",    # codex confirm dialogs
+    )
 
-    def dismiss_claude_resume_prompt_if_visible(
+    def confirm_dialog_visible(self, screen: str) -> bool:
+        return any(marker in screen for marker in self._CONFIRM_DIALOG_MARKERS)
+
+    def auto_confirm_prompt_if_visible(
         self,
         session_name: str,
         screen: str | None = None,
     ) -> bool:
-        """Claude shows a 'Resume from summary / Resume full session' picker
-        when resuming a large conversation. Unattended resumes must never
-        stall on it (and pasted messages must not be typed into the menu),
-        so auto-select option 1: Resume from summary (recommended)."""
-        if self.agent != "claude":
-            return False
+        """Auto-answer a blocking confirm dialog (model/effort switch, folder
+        trust) with option 1 so idle sessions never stall waiting for a human
+        and pasted messages are never typed into a menu."""
         if screen is None:
             try:
                 screen = self.capture(session_name)
             except subprocess.CalledProcessError:
                 return False
-        if not any(marker in screen for marker in self._RESUME_PROMPT_MARKERS):
+        if not self.confirm_dialog_visible(screen):
+            # Defensive: a resume picker appearing outside the launch window
+            # gets the same answer wait_for_session_ready gives it.
+            if "Resume full session as-is" in screen:
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", session_name, "Down", "Enter"],
+                    text=True, capture_output=True, check=False,
+                )
+                LOGGER.info("auto-selected 'Resume full session' for %s", session_name)
+                return True
             return False
-        LOGGER.info("resume prompt visible in %s; selecting 'Resume from summary'", session_name)
-        subprocess.run(
-            ["tmux", "send-keys", "-t", session_name, "1"],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        time.sleep(0.5)
+        LOGGER.info("auto-confirming dialog in %s (option 1)", session_name)
+        if re.search(r"^\s*[›❯>]?\s*1\.", screen, re.MULTILINE):
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, "1"],
+                text=True, capture_output=True, check=False,
+            )
+            time.sleep(0.3)
         subprocess.run(
             ["tmux", "send-keys", "-t", session_name, "Enter"],
-            text=True,
-            capture_output=True,
-            check=False,
+            text=True, capture_output=True, check=False,
         )
         return True
 
@@ -821,15 +835,29 @@ class TmuxSessionRuntime:
         )
 
     def _confirm_slash_dialog(self, session_name: str) -> None:
-        """/model and /effort pop a confirmation that needs a second Enter to
-        actually apply — paste_and_submit only presses Enter once (to run the
-        command). Send the confirming Enter so no human has to. A stray Enter at
-        an empty prompt is a harmless no-op when no dialog is shown."""
-        time.sleep(1)  # let the confirmation dialog render
-        subprocess.run(
-            ["tmux", "send-keys", "-t", session_name, "Enter"],
-            text=True, capture_output=True, check=False,
-        )
+        """/model and /effort pop a confirmation dialog that can render
+        slowly (the old blind 1s+Enter routinely fired before it appeared,
+        leaving the dialog stuck on screen). Poll for it, confirm option 1,
+        and verify it actually went away."""
+        confirmed = False
+        for _ in range(8):
+            time.sleep(1)
+            try:
+                screen = self.capture(session_name)
+            except subprocess.CalledProcessError:
+                return
+            if self.auto_confirm_prompt_if_visible(session_name, screen):
+                confirmed = True
+                continue  # loop again to verify dismissal / catch a second dialog
+            if confirmed:
+                return
+        if not confirmed:
+            # Dialog never showed — the command may apply without one. A
+            # stray Enter at an empty prompt is a harmless no-op.
+            subprocess.run(
+                ["tmux", "send-keys", "-t", session_name, "Enter"],
+                text=True, capture_output=True, check=False,
+            )
 
     def apply_effort_if_needed(self, session_name: str, effort: str | None) -> None:
         if not effort or self.session_effort_matches(session_name, effort):

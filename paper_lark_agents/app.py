@@ -1970,6 +1970,12 @@ class PaperAgentBridge:
             self._interactive_sessions.pop(chat_id, None)
             self._save_interactive_state()
             return
+        # Confirm-style dialogs (model switch, folder trust, resume picker)
+        # are auto-answered by the bridge — never forward them to Feishu.
+        runtime = self.agents.claude_session if agent == "claude" else self.agents.codex_session
+        if runtime.confirm_dialog_visible(screen) or "Resume full session as-is" in screen:
+            runtime.auto_confirm_prompt_if_visible(session_name, screen)
+            return
         prompt_hash = str(hash(tuple(prompt["options"])))
         key = f"{agent}:{chat_id}"
         if self._interactive_prompts.get(key) == prompt_hash:

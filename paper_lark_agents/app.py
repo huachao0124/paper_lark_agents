@@ -941,7 +941,7 @@ class PaperAgentBridge:
                     self.agent_display_name(route.agent),
                     self.chat_model_label(event.chat_id, route.agent),
                     self.chat_effort_label(event.chat_id, route.agent),
-                    force=source_agent is None,  # human message takes priority
+                    force=True,
                 )
             prompt, session_context = self.build_agent_prompt(
                 route.agent,

@@ -400,6 +400,43 @@ class RouterTests(unittest.TestCase):
         route = route_message("/claude critique this", enabled_agents=("codex",))
         self.assertEqual(route.kind, "ignore")
 
+    def test_shell_command_via_alias(self):
+        route = route_message(
+            "@Claude ! git push origin main",
+            enabled_agents=("claude",),
+            bot_aliases=("Claude",),
+            default_agent="claude",
+        )
+        self.assertEqual(route.kind, "shell_command")
+        self.assertEqual(route.agent, "claude")
+        self.assertEqual(route.text, "! git push origin main")
+
+    def test_shell_command_bare_agent(self):
+        route = route_message("Claude ! ls -la", respond_to_all=True)
+        self.assertEqual(route.kind, "shell_command")
+        self.assertEqual(route.agent, "claude")
+        self.assertEqual(route.text, "! ls -la")
+
+    def test_shell_command_strict_alias(self):
+        route = route_message(
+            "@Codex ! npm test",
+            enabled_agents=("codex",),
+            bot_aliases=("Codex",),
+            default_agent="codex",
+            strict_alias=True,
+        )
+        self.assertEqual(route.kind, "shell_command")
+        self.assertEqual(route.agent, "codex")
+        self.assertEqual(route.text, "! npm test")
+
+    def test_double_bang_is_not_shell_command(self):
+        route = route_message("Claude !! not a shell", respond_to_all=True)
+        self.assertNotEqual(route.kind, "shell_command")
+
+    def test_bare_bang_is_not_shell_command(self):
+        route = route_message("Claude !", respond_to_all=True)
+        self.assertNotEqual(route.kind, "shell_command")
+
 
 if __name__ == "__main__":
     unittest.main()

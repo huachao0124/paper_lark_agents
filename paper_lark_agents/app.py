@@ -706,7 +706,7 @@ class PaperAgentBridge:
             reply = self.dispatch(route, event, source_agent=source_agent)
         except (AgentError, LarkCLIError) as exc:
             reply = f"Bridge error: {exc}"
-        if self.settings.enable_memory and route.kind not in {"workspace", "clear", "responder", "session_command"}:
+        if self.settings.enable_memory and route.kind not in {"workspace", "clear", "responder", "session_command", "shell_command"}:
             self.memory.append_user(event, route.text or event.content)
         if reply and not self.is_no_reply(reply):
             self.send_reply(event, route, reply, source_agent=source_agent)
@@ -880,6 +880,9 @@ class PaperAgentBridge:
         if route.kind == "session_command":
             assert route.agent is not None
             return self.handle_session_command(route.agent, event.chat_id, route.text)
+        if route.kind == "shell_command":
+            assert route.agent is not None
+            return self.handle_shell_command(route.agent, event.chat_id, route.text)
         if route.kind == "multi_agent":
             if not route.agent_texts:
                 return ""
@@ -1123,6 +1126,18 @@ class PaperAgentBridge:
                 return f"{agent_name} `/model {model}` 已发送，等待确认。"
 
         return self.run_session_command_with_status(agent, chat_id, command, workspace)
+
+    def handle_shell_command(self, agent: str, chat_id: str, command: str) -> str:
+        """Paste `! <cmd>` into the agent's tmux session verbatim — no
+        wrap_prompt, no Message: prefix, no context block.  The leading `!`
+        triggers the agent CLI's native shell mode.  The bridge waits for the
+        reply via the normal JSONL transcript path."""
+        workspace = self.chat_workspace(chat_id)
+        runtime = self.agents.claude_session if agent == "claude" else self.agents.codex_session
+        session_name = runtime.session_name(chat_id)
+        runtime.ensure_session(session_name, chat_id, workspace)
+        runtime.paste_and_submit(session_name, command.strip())
+        return ""
 
     def run_session_command_with_status(
         self,

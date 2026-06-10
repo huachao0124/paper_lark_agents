@@ -17,6 +17,7 @@ RouteKind = Literal[
     "responder",
     "import_memory",
     "session_command",
+    "shell_command",
 ]
 AgentName = Literal["codex", "claude"]
 
@@ -100,6 +101,12 @@ def route_message(
     if alias_remainder is not None and default_agent in enabled and is_raw_session_command(alias_remainder):
         return Route("session_command", text=alias_remainder, agent=default_agent)
 
+    # "! command" — raw shell passthrough: send the line (with the "!")
+    # directly into the agent's input without any wrapping. The agent's own
+    # shell mode will execute it.
+    if alias_remainder is not None and default_agent in enabled and is_shell_command(alias_remainder):
+        return Route("shell_command", text=alias_remainder, agent=default_agent)
+
     if command_lowered in {"/help", "!help", "help"}:
         return Route("help", text=HELP_TEXT)
 
@@ -162,6 +169,8 @@ def route_message(
     # might steal messages addressed to another instance of the same agent type).
     if strict_alias and alias_remainder is not None and default_agent in enabled:
         if alias_remainder:
+            if is_shell_command(alias_remainder):
+                return Route("shell_command", text=alias_remainder, agent=default_agent)
             return Route("agent", text=alias_remainder, agent=default_agent)
         return Route("ignore")
 
@@ -260,6 +269,8 @@ def _route_explicit_agent_command(
             return Route("ignore")
         if is_raw_session_command(remainder):
             return Route("session_command", text=remainder, agent=agent)  # type: ignore[arg-type]
+        if is_shell_command(remainder):
+            return Route("shell_command", text=remainder, agent=agent)  # type: ignore[arg-type]
         if _is_bare_agent_prefix(prefix):
             continue
         return Route("agent", text=remainder, agent=agent)  # type: ignore[arg-type]
@@ -371,6 +382,11 @@ def _is_left_mention_boundary(char: str) -> bool:
 
 def is_raw_session_command(text: str) -> bool:
     return text.lstrip().startswith("/")
+
+
+def is_shell_command(text: str) -> bool:
+    stripped = text.lstrip()
+    return stripped.startswith("!") and len(stripped) > 1 and not stripped[1:].lstrip().startswith("!")
 
 
 def _strip_prefix(

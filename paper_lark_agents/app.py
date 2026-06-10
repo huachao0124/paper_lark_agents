@@ -1146,8 +1146,11 @@ class PaperAgentBridge:
     def handle_shell_command(self, agent: str, chat_id: str, command: str) -> str:
         """Paste `! <cmd>` into the agent's tmux session verbatim — no
         wrap_prompt, no Message: prefix, no context block.  The leading `!`
-        triggers the agent CLI's native shell mode.  The bridge waits for the
-        reply via the normal JSONL transcript path."""
+        triggers the agent CLI's native shell mode.
+
+        After pasting, poll the tmux screen until the shell output settles
+        (the `!` output does not go through the JSONL transcript), then send
+        the captured output back to Feishu."""
         raw = command.strip()
         command = self._strip_feishu_markdown(raw)
         if command != raw:
@@ -1156,8 +1159,58 @@ class PaperAgentBridge:
         runtime = self.agents.claude_session if agent == "claude" else self.agents.codex_session
         session_name = runtime.session_name(chat_id)
         runtime.ensure_session(session_name, chat_id, workspace)
+        # Snapshot screen before pasting so we can diff later.
+        try:
+            before = runtime.capture(session_name)
+        except Exception:
+            before = ""
         runtime.paste_and_submit(session_name, command)
-        return ""
+        # Poll until the screen stops changing (shell finished) or timeout.
+        import time as _time
+        output = ""
+        prev = ""
+        stable_ticks = 0
+        for _ in range(30):  # up to 30s
+            _time.sleep(1)
+            try:
+                screen = runtime.capture(session_name)
+            except Exception:
+                continue
+            # The output is whatever is new on screen after the command.
+            if screen == prev:
+                stable_ticks += 1
+                if stable_ticks >= 3:
+                    break
+            else:
+                stable_ticks = 0
+                prev = screen
+        # Extract lines that were not in the before-snapshot.
+        before_lines = set(before.splitlines())
+        new_lines = [
+            line for line in prev.splitlines()
+            if line.strip() and line not in before_lines
+        ]
+        # Drop the command echo itself and the prompt line.
+        cmd_short = command[:60]
+        output_lines = [
+            line for line in new_lines
+            if not line.lstrip().startswith(("❯", "›", "⎿"))
+            and cmd_short not in line
+            and "auto mode" not in line
+            and "for agents" not in line
+        ]
+        # Also grab ⎿ lines (shell output in Claude CLI)
+        result_lines = [
+            line.lstrip("⎿").strip()
+            for line in new_lines
+            if line.lstrip().startswith("⎿") and line.strip() != "⎿"
+        ]
+        output = "\n".join(result_lines) if result_lines else "\n".join(output_lines)
+        output = output.strip()
+        if not output:
+            output = "(命令已执行，无输出)"
+        agent_name = self.agent_display_name(agent)
+        return f"**{agent_name} shell**\n```\n{output}\n```"
 
     def run_session_command_with_status(
         self,

@@ -12,7 +12,10 @@ _INTERACTIVE_MARKERS = [
     "Press enter to confirm or esc to cancel",
     "Press enter to confirm or esc to go back",
     "1. Yes, proceed (y)",
+    "1. Yes, switch to",
+    "No, go back",
     "› 1.",
+    "❯ 1.",
 ]
 
 

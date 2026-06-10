@@ -175,7 +175,21 @@ class TurnCardManager:
                     with self._lock:
                         card.message_id = new.message_id
                     return
-        self._update_plain(card, detail)
+        # Accumulate progress for plain cards so users see all steps, not
+        # just the latest one.
+        acc_key = card.message_id
+        with self._lock:
+            prev = self._accumulated.get(acc_key, "")
+            if prev and detail not in prev:
+                combined = f"{prev}\n{detail}"
+                # Cap to avoid hitting Feishu card size limits.
+                if len(combined) > 3000:
+                    combined = combined[-3000:]
+                self._accumulated[acc_key] = combined
+            else:
+                combined = detail
+                self._accumulated[acc_key] = combined
+        self._update_plain(card, combined)
 
     def finalize(self, card: TurnCard, state: str, body: str) -> bool:
         if not card:
@@ -188,6 +202,8 @@ class TurnCardManager:
                 self._active.pop(key)
             if card.card_id:
                 self._accumulated.pop(card.card_id, None)
+            if card.message_id:
+                self._accumulated.pop(card.message_id, None)
             card.sequence += 1
         if card.card_id and card.strategy == "streaming":
             try:

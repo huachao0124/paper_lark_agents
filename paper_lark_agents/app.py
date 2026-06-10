@@ -478,6 +478,8 @@ class PaperAgentBridge:
             self._check_interactive_prompt(run.agent, run.chat_id, session_name, screen)
         except Exception:
             pass
+        card.model = self.chat_model_label(run.chat_id, run.agent)
+        card.effort = self.chat_effort_label(run.chat_id, run.agent)
         self.cards.update(card, detail)
         self._pending_status_updates[run.run_id] = time.time()
 
@@ -977,6 +979,8 @@ class PaperAgentBridge:
             try:
                 def _progress(detail: str, _agent=route.agent, _chat=event.chat_id) -> None:
                     if turn_card:
+                        turn_card.model = self.chat_model_label(_chat, _agent)
+                        turn_card.effort = self.chat_effort_label(_chat, _agent)
                         self.cards.update(turn_card, detail)
                     runtime = self.agents.codex_session if _agent == "codex" else self.agents.claude_session
                     try:

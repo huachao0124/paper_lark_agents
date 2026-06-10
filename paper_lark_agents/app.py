@@ -975,6 +975,17 @@ class PaperAgentBridge:
                     timeout=self.agent_timeout(route.agent),
                 )
             try:
+                def _progress(detail: str, _agent=route.agent, _chat=event.chat_id) -> None:
+                    if turn_card:
+                        self.cards.update(turn_card, detail)
+                    runtime = self.agents.codex_session if _agent == "codex" else self.agents.claude_session
+                    try:
+                        sn = runtime.session_name(_chat)
+                        screen = runtime.capture(sn)
+                        self._check_interactive_prompt(_agent, _chat, sn, screen)
+                    except Exception:
+                        pass
+
                 if route.agent == "codex":
                     result = self.agents.run_codex(
                         prompt,
@@ -983,9 +994,7 @@ class PaperAgentBridge:
                         workspace=workspace,
                         model=model,
                         effort=effort,
-                        progress_callback=(lambda detail: self.cards.update(turn_card, detail))
-                        if turn_card
-                        else None,
+                        progress_callback=_progress,
                         run_id=run_id,
                     )
                 else:
@@ -996,9 +1005,7 @@ class PaperAgentBridge:
                         workspace=workspace,
                         model=model,
                         effort=effort,
-                        progress_callback=(lambda detail: self.cards.update(turn_card, detail))
-                        if turn_card
-                        else None,
+                        progress_callback=_progress,
                         run_id=run_id,
                     )
             except AgentStillRunning as exc:

@@ -2315,16 +2315,27 @@ class PaperAgentBridge:
                 delivered = False
                 if self.settings.send_progress:
                     agent_name = self.agent_display_name(agent)
-                    msg_id = self.cards.send_done_card(
-                        event.chat_id, agent, agent_name,
-                        text[:self.settings.max_message_chars],
-                        model=self.chat_model_label(event.chat_id, agent),
-                        effort=self.chat_effort_label(event.chat_id, agent),
-                    )
-                    LOGGER.info("follow-up card sent for %s in %s: %s", agent, event.chat_id, msg_id or "no msg_id")
-                    if msg_id:
-                        self.outbox.remember_message_id(event.chat_id, msg_id, agent=agent, discussion_trigger=False)
-                        delivered = True
+                    limit = self.settings.max_message_chars
+                    body = text if len(text) <= limit else text[:limit].rstrip() + "\n\n…（下接）"
+                    # Prefer finalizing the existing Running card → Done
+                    # instead of creating a new card (which leaves the Running
+                    # card orphaned on screen).
+                    active = self.cards.active_for(agent, event.chat_id)
+                    if active:
+                        if self.cards.finalize(active, "done", body):
+                            delivered = True
+                            LOGGER.info("follow-up finalized Running card for %s in %s", agent, event.chat_id)
+                    if not delivered:
+                        msg_id = self.cards.send_done_card(
+                            event.chat_id, agent, agent_name,
+                            body,
+                            model=self.chat_model_label(event.chat_id, agent),
+                            effort=self.chat_effort_label(event.chat_id, agent),
+                        )
+                        LOGGER.info("follow-up card sent for %s in %s: %s", agent, event.chat_id, msg_id or "no msg_id")
+                        if msg_id:
+                            self.outbox.remember_message_id(event.chat_id, msg_id, agent=agent, discussion_trigger=False)
+                            delivered = True
                 else:
                     try:
                         self.send_bridge_markdown(

@@ -343,7 +343,7 @@ class PaperAgentBridge:
             return cached
         if not run.status_message_id:
             return None
-        return TurnCard(
+        card = TurnCard(
             run.status_message_id,
             run.chat_id,
             run.agent,
@@ -353,6 +353,9 @@ class PaperAgentBridge:
             run.created_at,
             card_id=run.card_id,
         )
+        # Register the reconstructed card so acquire()/recovery see it and
+        # cannot spawn a duplicate for the same (agent, chat).
+        return self.cards.adopt(card)
 
     def process_pending_run(self, run: PendingRun) -> None:
         if run.run_id in self._active_run_ids:

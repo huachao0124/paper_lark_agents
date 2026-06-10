@@ -51,6 +51,18 @@ class TurnCardManager:
         with self._lock:
             return self._active.get(self._key(agent, chat_id))
 
+    def adopt(self, card: TurnCard) -> TurnCard:
+        """Register a card reconstructed from persisted state (pending run
+        records) as the active card for its key. If another card is already
+        registered, that one wins — the caller must use it instead."""
+        key = self._key(card.agent, card.chat_id)
+        with self._lock:
+            existing = self._active.get(key)
+            if existing is not None:
+                return existing
+            self._active[key] = card
+            return card
+
     def clear_all(self) -> int:
         with self._lock:
             count = len(self._active)
@@ -100,6 +112,17 @@ class TurnCardManager:
         if not card:
             return
         if not card.message_id:
+            key = self._key(card.agent, card.chat_id)
+            with self._lock:
+                active = self._active.get(key)
+                if active is not None and active is not card:
+                    # A newer card already owns this (agent, chat) — this
+                    # caller holds a stale reference; recovering it would
+                    # post a duplicate card.
+                    return
+                # Re-register (e.g. resuming a recovered run after restart)
+                # so concurrent stale holders are locked out.
+                self._active[key] = card
             new = self._create_card(
                 card.chat_id, card.agent, card.agent_name,
                 card.model, card.effort, "plain",
@@ -133,16 +156,20 @@ class TurnCardManager:
                 return
             except Exception as exc:
                 LOGGER.warning("streaming update failed for %s: %s", card_id, exc)
-                if not self._renew_streaming_card(card, detail, seq):
-                    self._downgrade_to_plain(card)
-                    new = self._create_card(
-                        card.chat_id, card.agent, card.agent_name,
-                        card.model, card.effort, "plain",
-                    )
-                    if new:
-                        with self._lock:
-                            card.message_id = new.message_id
-                        return
+                if self._renew_streaming_card(card, detail, seq):
+                    # Renewal already streamed the detail to the new card —
+                    # falling through would im-PATCH the streaming message
+                    # (230099), killing the card we just created.
+                    return
+                self._downgrade_to_plain(card)
+                new = self._create_card(
+                    card.chat_id, card.agent, card.agent_name,
+                    card.model, card.effort, "plain",
+                )
+                if new:
+                    with self._lock:
+                        card.message_id = new.message_id
+                    return
         self._update_plain(card, detail)
 
     def finalize(self, card: TurnCard, state: str, body: str) -> bool:
@@ -150,7 +177,10 @@ class TurnCardManager:
             return False
         key = self._key(card.agent, card.chat_id)
         with self._lock:
-            self._active.pop(key, None)
+            # Only deregister if this card is the registered one — a stale
+            # holder finalizing late must not evict the live card.
+            if self._active.get(key) is card:
+                self._active.pop(key)
             if card.card_id:
                 self._accumulated.pop(card.card_id, None)
             card.sequence += 1

@@ -97,7 +97,12 @@ class TurnCardManager:
                 LOGGER.info("interrupting old card %s for %s", old.message_id[:12], key)
                 self._interrupt_card(old)
             if strategy == "auto":
-                strategy = "streaming" if self._supports_streaming() else "plain"
+                # Streaming cards have a 10-min server-side timeout. For long-
+                # running agent turns the card gets killed and must be renewed
+                # (deleting the old message each time — users see repeated
+                # withdrawals). Use plain cards instead — they can be updated
+                # indefinitely.
+                strategy = "plain"
             card = self._create_card(chat_id, agent, agent_name, model, effort, strategy)
         finally:
             # Always release the creation guard — a leaked key would block

@@ -1129,25 +1129,29 @@ class PaperAgentBridge:
 
     @staticmethod
     def _strip_feishu_markdown(text: str) -> str:
-        """Feishu auto-wraps URLs as [display](url) and percent-encodes
-        shell metacharacters inside hrefs. Restore plain text so shell
-        commands pasted into tmux work as the user typed them."""
+        """Feishu auto-wraps URLs in two styles:
+        1. [display](href) — markdown links with percent-encoded metacharacters
+        2. <URL> — angle-bracket auto-links
+        Restore plain text so shell commands work as the user typed them."""
         from urllib.parse import unquote
-        # Prefer the display text when it looks like a raw URL (starts with
-        # http/ftp/ssh); fall back to the href (unquote percent-encoding).
         def _pick(m: re.Match) -> str:
             display, href = m.group(1), m.group(2)
             if display.startswith(("http", "ftp", "ssh", "git@")):
                 return display
             return unquote(href)
-        return re.sub(r'\[([^\]]*)\]\(([^)]+)\)', _pick, text)
+        text = re.sub(r'\[([^\]]*)\]\(([^)]+)\)', _pick, text)
+        text = re.sub(r'<(https?://[^>]+)>', r'\1', text)
+        return text
 
     def handle_shell_command(self, agent: str, chat_id: str, command: str) -> str:
         """Paste `! <cmd>` into the agent's tmux session verbatim — no
         wrap_prompt, no Message: prefix, no context block.  The leading `!`
         triggers the agent CLI's native shell mode.  The bridge waits for the
         reply via the normal JSONL transcript path."""
-        command = self._strip_feishu_markdown(command.strip())
+        raw = command.strip()
+        command = self._strip_feishu_markdown(raw)
+        if command != raw:
+            LOGGER.info("shell_command markdown stripped: %r", command)
         workspace = self.chat_workspace(chat_id)
         runtime = self.agents.claude_session if agent == "claude" else self.agents.codex_session
         session_name = runtime.session_name(chat_id)

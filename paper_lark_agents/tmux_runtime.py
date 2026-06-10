@@ -202,10 +202,28 @@ class TmuxSessionRuntime:
         command = self.command(workspace, model=model, effort=effort)
         if self.session_exists(session_name):
             if self._cli_crashed(session_name):
-                LOGGER.warning("CLI crashed in %s, recreating session", session_name)
+                # The CLI process died but its conversation transcript is
+                # intact on disk — keep the session id so the recreated
+                # session resumes the same conversation. Guard against a
+                # resume that itself crashes: only retry resume if the
+                # previous recreation was not already a resume attempt.
+                meta = self.read_metadata(session_name)
+                resume_again = not meta.get("crash_resume_attempted") and bool(
+                    str(meta.get("session_uuid") or "").strip()
+                )
+                LOGGER.warning(
+                    "CLI crashed in %s, recreating session (resume=%s)",
+                    session_name,
+                    resume_again,
+                )
                 self.kill_session(session_name)
-                self._clear_stale_transcript(session_name)
+                self._clear_stale_transcript(session_name, keep_uuid=resume_again)
+                self._update_metadata(session_name, crash_resume_attempted=resume_again)
             else:
+                if self.read_metadata(session_name).get("crash_resume_attempted"):
+                    # Session is alive and healthy — the post-crash resume
+                    # worked, so allow resuming again on a future crash.
+                    self._update_metadata(session_name, crash_resume_attempted=False)
                 ws_match = self.session_workspace_matches(session_name, workspace)
                 cmd_match = self.session_command_matches(session_name, command)
                 if ws_match and cmd_match:
@@ -214,14 +232,14 @@ class TmuxSessionRuntime:
                     self.refresh_detected_session_labels(session_name)
                     self._clear_stale_input(session_name)
                     return not self.session_initialized(session_name)
-            # Only workspace changed (model/effort/args unchanged) — try to
-            # preserve the agent's conversation context.
-            only_workspace_changed = not ws_match and self._command_matches_ignoring_workspace(session_name, command)
-            if only_workspace_changed:
-                if self._switch_workspace_in_place(session_name, chat_id, workspace):
-                    return not self.session_initialized(session_name)
-            # Fall through: kill and recreate (preserving context via resume).
-            self.kill_session(session_name)
+                # Only workspace changed (model/effort/args unchanged) — try to
+                # preserve the agent's conversation context.
+                only_workspace_changed = not ws_match and self._command_matches_ignoring_workspace(session_name, command)
+                if only_workspace_changed:
+                    if self._switch_workspace_in_place(session_name, chat_id, workspace):
+                        return not self.session_initialized(session_name)
+                # Fall through: kill and recreate (preserving context via resume).
+                self.kill_session(session_name)
         self.configure_history_limit()
         # Resume the prior session when we recorded its id (survives container
         # restart — metadata lives on persistent .state). For codex, resume
@@ -426,12 +444,13 @@ class TmuxSessionRuntime:
         except (subprocess.CalledProcessError, AttributeError):
             pass
 
-    def _clear_stale_transcript(self, session_name: str) -> None:
+    def _clear_stale_transcript(self, session_name: str, keep_uuid: bool = False) -> None:
         data = self.read_metadata(session_name)
         if not data:
             return
         data.pop("transcript_path", None)
-        data.pop("session_uuid", None)
+        if not keep_uuid:
+            data.pop("session_uuid", None)
         data.pop("session_prompt_version", None)
         data.pop("run_cursors", None)
         path = self.metadata_path(session_name)

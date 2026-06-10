@@ -1115,7 +1115,7 @@ class PaperAgentBridge:
                 effort=effort,
             )
             if sent:
-                return f"{agent_name} effort 已设为 `{effort}`（当前会话生效）。"
+                return f"{agent_name} `/effort {effort}` 已发送，等待确认。"
             return f"{agent_name} effort 已记为 `{effort}`，会话当前忙碌，下轮空闲时自动生效。"
         if model is not None:
             try:
@@ -1131,7 +1131,7 @@ class PaperAgentBridge:
             )
             agent_name = self.agent_display_name(agent)
             if sent:
-                return f"{agent_name} model set to `{model}` in the current session."
+                return f"{agent_name} `/model {model}` 已发送，等待确认。"
 
         return self.run_session_command_with_status(agent, chat_id, command, workspace)
 

@@ -2326,16 +2326,18 @@ class PaperAgentBridge:
                             delivered = True
                             LOGGER.info("follow-up finalized Running card for %s in %s", agent, event.chat_id)
                     if not delivered:
-                        msg_id = self.cards.send_done_card(
-                            event.chat_id, agent, agent_name,
-                            body,
-                            model=self.chat_model_label(event.chat_id, agent),
-                            effort=self.chat_effort_label(event.chat_id, agent),
-                        )
-                        LOGGER.info("follow-up card sent for %s in %s: %s", agent, event.chat_id, msg_id or "no msg_id")
-                        if msg_id:
-                            self.outbox.remember_message_id(event.chat_id, msg_id, agent=agent, discussion_trigger=False)
+                        # No active Running card — this is a supplementary
+                        # follow-up after the main reply was already delivered.
+                        # Send as plain markdown instead of a new Done card to
+                        # avoid card clutter.
+                        try:
+                            self.send_bridge_markdown(
+                                event.chat_id, text, agent=agent, discussion_trigger=False,
+                            )
                             delivered = True
+                            LOGGER.info("follow-up sent as markdown for %s in %s", agent, event.chat_id)
+                        except Exception:
+                            LOGGER.warning("follow-up markdown send failed for %s in %s", agent, event.chat_id)
                 else:
                     try:
                         self.send_bridge_markdown(

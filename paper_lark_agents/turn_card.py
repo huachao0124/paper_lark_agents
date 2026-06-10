@@ -79,16 +79,21 @@ class TurnCardManager:
             elif key in self._creating:
                 return None
             self._creating.add(key)
-        if old and force:
-            LOGGER.info("interrupting old card %s for %s", old.message_id[:12], key)
-            self._interrupt_card(old)
-        if strategy == "auto":
-            strategy = "streaming" if self._supports_streaming() else "plain"
-        card = self._create_card(chat_id, agent, agent_name, model, effort, strategy)
-        with self._lock:
-            self._creating.discard(key)
-            if card:
-                self._active[key] = card
+        card: TurnCard | None = None
+        try:
+            if old and force:
+                LOGGER.info("interrupting old card %s for %s", old.message_id[:12], key)
+                self._interrupt_card(old)
+            if strategy == "auto":
+                strategy = "streaming" if self._supports_streaming() else "plain"
+            card = self._create_card(chat_id, agent, agent_name, model, effort, strategy)
+        finally:
+            # Always release the creation guard — a leaked key would block
+            # every future card for this (agent, chat) until restart.
+            with self._lock:
+                self._creating.discard(key)
+                if card:
+                    self._active[key] = card
         return card
 
     def update(self, card: TurnCard, detail: str) -> None:
@@ -148,10 +153,10 @@ class TurnCardManager:
             self._active.pop(key, None)
             if card.card_id:
                 self._accumulated.pop(card.card_id, None)
+            card.sequence += 1
         if card.card_id and card.strategy == "streaming":
             try:
                 footer = self._footer(card)
-                card.sequence += 1
                 template = {"done": "green", "failed": "red", "skipped": "grey"}.get(state, "blue")
                 title = f"{card.agent_name} · {state.title()}"
                 self._lark.finalize_streaming_card(
@@ -263,6 +268,7 @@ class TurnCardManager:
 
     def _renew_streaming_card(self, card: TurnCard, detail: str, seq: int) -> bool:
         old_msg = card.message_id
+        old_card_id = card.card_id
         try:
             new_card_id = self._lark.create_streaming_card(f"{card.agent_name} · Running")
             new_msg_id = self._lark.send_streaming_card(card.chat_id, new_card_id)
@@ -272,8 +278,8 @@ class TurnCardManager:
                 card.message_id = new_msg_id
                 card.sequence = 1
                 card.started_at = time.time()
-                if card.card_id:
-                    self._accumulated.pop(card.card_id, None)
+                if old_card_id:
+                    self._accumulated.pop(old_card_id, None)
             self._lark.stream_card_content(new_card_id, detail, sequence=1)
             return True
         except Exception:
@@ -300,7 +306,6 @@ class TurnCardManager:
             except Exception:
                 pass
         # Finalize failed or not streaming — delete the message.
-        self._delete_message(card.message_id)
         self._delete_message(card.message_id)
 
     def _delete_message(self, message_id: str) -> None:

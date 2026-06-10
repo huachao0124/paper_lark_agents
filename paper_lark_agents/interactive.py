@@ -45,7 +45,9 @@ def detect_interactive_prompt(screen: str) -> dict | None:
             idx = m.group(1)
             text = m.group(2).strip()
             options.append(f"{idx}. {text}")
-    if not options:
+    # A real selection menu always has at least two options; a single match
+    # is usually an ordinary numbered list in agent output.
+    if len(options) < 2:
         return None
     return {
         "title": title or "请选择：",

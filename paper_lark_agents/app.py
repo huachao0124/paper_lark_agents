@@ -213,6 +213,7 @@ class PaperAgentBridge:
         self._active_run_ids: set[str] = set()
         self.cards = TurnCardManager(self.lark, self.settings)
         self._recent_handoff_sigs: set[str] = set()
+        self._recent_handoff_sigs_lock = threading.Lock()
         self._delivered_sigs: set[str] = set()
         self._delivered_sigs_lock = threading.Lock()
         # Follow-up poller state: per (agent, chat_id), the transcript cursor
@@ -482,21 +483,6 @@ class PaperAgentBridge:
         card.effort = self.chat_effort_label(run.chat_id, run.agent)
         self.cards.update(card, detail)
         self._pending_status_updates[run.run_id] = time.time()
-
-    def recovered_status_handle(self, run: PendingRun) -> StatusHandle | None:
-        if not run.status_message_id:
-            return None
-        return StatusHandle(
-            self,
-            run.chat_id,
-            run.status_message_id,
-            run.agent,
-            self.agent_display_name(run.agent),
-            Path(run.workspace).expanduser().resolve(),
-            run.model_label or self.chat_model_label(run.chat_id, run.agent),
-            run.effort_label or self.chat_effort_label(run.chat_id, run.agent),
-            run.created_at,
-        )
 
     def pending_run_event(self, run: PendingRun) -> MessageEvent:
         return MessageEvent(
@@ -2197,9 +2183,11 @@ class PaperAgentBridge:
                 if new_cur != cur:
                     dirty = True
                 with self._followup_lock:
-                    if key in self._followup_cursors:
-                        old = self._followup_cursors[key]
-                        self._followup_cursors[key] = (old[0], new_cur, *old[2:])
+                    entry = self._followup_cursors.get(key)
+                    # Only advance if the entry was not re-registered with a
+                    # different transcript while we were polling.
+                    if entry and entry[0] == path:
+                        self._followup_cursors[key] = (path, new_cur, *entry[2:])
                 if text is None or self.is_no_reply(text):
                     continue
                 sig = text[:200]
@@ -2215,9 +2203,9 @@ class PaperAgentBridge:
                     if sig in recent:
                         key_sent.add(sig)
                         continue
-                key_sent.add(sig)
                 agent = key.split(":", 1)[0]
                 LOGGER.info("follow-up reply from %s in %s", agent, event.chat_id)
+                delivered = False
                 if self.settings.send_progress:
                     agent_name = self.agent_display_name(agent)
                     msg_id = self.cards.send_done_card(
@@ -2229,24 +2217,31 @@ class PaperAgentBridge:
                     LOGGER.info("follow-up card sent for %s in %s: %s", agent, event.chat_id, msg_id or "no msg_id")
                     if msg_id:
                         self.outbox.remember_message_id(event.chat_id, msg_id, agent=agent, discussion_trigger=False)
-                    if self.settings.enable_memory:
-                        self.memory.append_assistant(event.chat_id, agent, text)
-                    if self.should_enqueue_teammate_handoff(route, text, depth):
-                        self.enqueue_teammate_handoff(
-                            event, source_agent=agent, reply=text,
-                            inbound_source_agent=source_agent, handoff_depth=depth,
-                        )
+                        delivered = True
                 else:
-                    self.send_bridge_markdown(
-                        event.chat_id, text, agent=agent, discussion_trigger=False,
-                    )
-                    if self.settings.enable_memory:
-                        self.memory.append_assistant(event.chat_id, agent, text)
-                    if self.should_enqueue_teammate_handoff(route, text, depth):
-                        self.enqueue_teammate_handoff(
-                            event, source_agent=agent, reply=text,
-                            inbound_source_agent=source_agent, handoff_depth=depth,
+                    try:
+                        self.send_bridge_markdown(
+                            event.chat_id, text, agent=agent, discussion_trigger=False,
                         )
+                        delivered = True
+                    except Exception:
+                        LOGGER.warning("follow-up markdown send failed in %s", event.chat_id)
+                if not delivered:
+                    # Send failed and the cursor already advanced past this
+                    # reply — roll it back so the next tick retries.
+                    with self._followup_lock:
+                        entry = self._followup_cursors.get(key)
+                        if entry and entry[0] == path and entry[1] == new_cur:
+                            self._followup_cursors[key] = (path, cur, *entry[2:])
+                    continue
+                key_sent.add(sig)
+                if self.settings.enable_memory:
+                    self.memory.append_assistant(event.chat_id, agent, text)
+                if self.should_enqueue_teammate_handoff(route, text, depth):
+                    self.enqueue_teammate_handoff(
+                        event, source_agent=agent, reply=text,
+                        inbound_source_agent=source_agent, handoff_depth=depth,
+                    )
             # Checkpoint advanced offsets so a restart resumes from the right
             # place and re-scans anything written while the bridge was down.
             if dirty:
@@ -2265,17 +2260,26 @@ class PaperAgentBridge:
         if self.is_no_reply(text):
             self.cards.finalize(card, "skipped", "—")
             return
+        sig = text[:200]
+        # Claim the sig before the (slow) network delivery so followup_loop
+        # does not double-send it meanwhile; release the claim on failure so
+        # the reply is not lost from every delivery path.
         with self._delivered_sigs_lock:
-            self._delivered_sigs.add(text[:200])
+            self._delivered_sigs.add(sig)
             if len(self._delivered_sigs) > 200:
                 self._delivered_sigs = set(list(self._delivered_sigs)[-100:])
         limit = self.settings.max_message_chars
         head = text if len(text) <= limit else text[:limit].rstrip() + "\n\n…（下接）"
-        if not self.cards.finalize(card, "done", head):
-            # Card update failed — deliver the full reply as text so it is never lost.
-            self.send_bridge_markdown(card.chat_id, text, agent=route.agent, discussion_trigger=False)
-        elif len(text) > limit:
-            self.send_bridge_markdown(card.chat_id, text[limit:], agent=route.agent, discussion_trigger=False)
+        try:
+            if not self.cards.finalize(card, "done", head):
+                # Card update failed — deliver the full reply as text so it is never lost.
+                self.send_bridge_markdown(card.chat_id, text, agent=route.agent, discussion_trigger=False)
+            elif len(text) > limit:
+                self.send_bridge_markdown(card.chat_id, text[limit:], agent=route.agent, discussion_trigger=False)
+        except Exception:
+            with self._delivered_sigs_lock:
+                self._delivered_sigs.discard(sig)
+            raise
         if route.kind in {"agent", "debate"}:
             self.relay_artifacts(card.chat_id, text, self.chat_workspace(card.chat_id))
         if self.should_enqueue_teammate_handoff(route, text, handoff_depth):
@@ -2290,41 +2294,6 @@ class PaperAgentBridge:
         self.outbox.remember_message_id(card.chat_id, card.message_id, agent=route.agent, discussion_trigger=False)
         if self.settings.enable_memory:
             self.memory.append_assistant(card.chat_id, route.agent, text)
-
-    def start_agent_status(
-        self,
-        chat_id: str,
-        agent: str,
-        workspace: Path,
-        model_text: str,
-        effort_text: str,
-    ) -> StatusHandle | None:
-        agent_name = self.agent_display_name(agent)
-        started_at = time.time()
-        handle = StatusHandle(
-            self,
-            chat_id,
-            None,
-            agent,
-            agent_name,
-            workspace,
-            model_text,
-            effort_text,
-            started_at,
-        )
-        message_id = self.ensure_status_dashboard_message(chat_id)
-        if not message_id:
-            self.send_progress_markdown(
-                chat_id,
-                f"{agent_name} is processing...\n\n"
-                f"- workspace: `{workspace}`\n"
-                f"- model: `{model_text}`\n"
-                f"- effort: `{effort_text}`",
-            )
-            return None
-        handle.message_id = message_id
-        handle.update("running", "Starting assistant session turn.")
-        return handle
 
     def ensure_status_dashboard_message(self, chat_id: str) -> str | None:
         snapshot_for_create = self.status_dashboards.snapshot(chat_id)
@@ -2525,12 +2494,13 @@ class PaperAgentBridge:
         # Dedup: multiple code paths (finalize_turn_reply, followup_loop,
         # send_reply) can try to enqueue the same reply as a handoff.
         sig = f"{source_agent}:{event.chat_id}:{reply[:200]}"
-        if sig in self._recent_handoff_sigs:
-            return
-        self._recent_handoff_sigs.add(sig)
-        # Keep the set bounded.
-        if len(self._recent_handoff_sigs) > 200:
-            self._recent_handoff_sigs = set(list(self._recent_handoff_sigs)[-100:])
+        with self._recent_handoff_sigs_lock:
+            if sig in self._recent_handoff_sigs:
+                return
+            self._recent_handoff_sigs.add(sig)
+            # Keep the set bounded.
+            if len(self._recent_handoff_sigs) > 200:
+                self._recent_handoff_sigs = set(list(self._recent_handoff_sigs)[-100:])
         next_depth = handoff_depth + 1
         if next_depth > max(0, self.settings.max_agent_discussion_turns):
             LOGGER.info("skipping handoff from %s; discussion depth cap reached", source_agent)

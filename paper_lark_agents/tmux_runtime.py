@@ -759,7 +759,7 @@ class TmuxSessionRuntime:
         if screen is None:
             try:
                 screen = self.capture(session_name)
-            except subprocess.CalledProcessError:
+            except (subprocess.CalledProcessError, AttributeError):
                 return False
         if not self.confirm_dialog_visible(screen):
             # Defensive: a resume picker appearing outside the launch window
@@ -844,7 +844,7 @@ class TmuxSessionRuntime:
             time.sleep(1)
             try:
                 screen = self.capture(session_name)
-            except subprocess.CalledProcessError:
+            except (subprocess.CalledProcessError, AttributeError):
                 return
             if self.auto_confirm_prompt_if_visible(session_name, screen):
                 confirmed = True

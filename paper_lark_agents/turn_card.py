@@ -370,7 +370,19 @@ class TurnCardManager:
                 return
             except Exception:
                 pass
-        # Finalize failed or not streaming — delete the message.
+        # Update the card in place to "Interrupted" instead of deleting it.
+        # Deleting causes "撤回了一条消息" and leaves progress threads holding
+        # stale message_ids that trigger dead-card recovery (duplicate cards).
+        if card.message_id:
+            interrupted = turn_reply_card(
+                card.agent_name, "skipped", "—",
+                model=card.model, effort=card.effort, started_at=card.started_at,
+            )
+            try:
+                self._lark.update_card(card.message_id, interrupted)
+                return
+            except Exception:
+                pass
         self._delete_message(card.message_id)
 
     def _delete_message(self, message_id: str) -> None:

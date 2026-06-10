@@ -388,8 +388,18 @@ class PaperAgentBridge:
                 except Exception:
                     pass
                 if not still_busy:
+                    if not card:
+                        card = self.cards.active_for(run.agent, run.chat_id)
                     if card:
                         self.cards.finalize(card, "failed", "超时未完成，请重试。")
+                    else:
+                        self.cards.send_done_card(
+                            run.chat_id, run.agent,
+                            self.agent_display_name(run.agent),
+                            "超时未完成，请重试。",
+                            model=self.chat_model_label(run.chat_id, run.agent),
+                            effort=self.chat_effort_label(run.chat_id, run.agent),
+                        )
                     self.pending_runs.mark_done(run.run_id, status="timeout")
                     LOGGER.info("pending run %s timed out after %.0fs (agent idle)", run.run_id, age)
                     return

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import shlex
@@ -243,8 +244,10 @@ class TmuxSessionRuntime:
         self.configure_history_limit()
         # Resume the prior session when we recorded its id (survives container
         # restart — metadata lives on persistent .state). For codex, resume
-        # works even across workspace changes (-C flag). For claude, resume is
-        # only used when workspace is unchanged (it always /cd-switches first).
+        # works even across workspace changes (-C flag). Claude looks up
+        # sessions in the per-cwd project dir, so on workspace change the
+        # transcript is migrated there first — resume is always by explicit
+        # id, never the interactive picker.
         prior_meta = self.read_metadata(session_name)
         prior_uuid = prior_meta.get("session_uuid")
         resume_uuid = None
@@ -253,6 +256,10 @@ class TmuxSessionRuntime:
                 # codex resume always works — -C is stripped, tmux -c sets cwd.
                 resume_uuid = prior_uuid.strip()
             elif str(prior_meta.get("workspace") or "") == str(workspace):
+                resume_uuid = prior_uuid.strip()
+            elif self._migrate_claude_transcript(prior_uuid.strip(), workspace):
+                # Workspace changed — transcript now lives in the new
+                # workspace's project dir, so resume finds it there.
                 resume_uuid = prior_uuid.strip()
         launch, keep_uuid = self.build_launch_command(command, resume_uuid)
         shell_command = " ".join(shlex.quote(part) for part in launch)
@@ -284,6 +291,12 @@ class TmuxSessionRuntime:
             self.store_session_uuid(session_name, keep_uuid)
         self.ensure_transcript_pipe(session_name)
         self.wait_for_session_ready(session_name)
+        if resume_uuid and self.agent == "claude":
+            # The resume picker may render a beat after the UI is ready.
+            for _ in range(4):
+                if self.dismiss_claude_resume_prompt_if_visible(session_name):
+                    break
+                time.sleep(0.5)
         self.refresh_detected_session_labels(session_name)
         self.apply_startup_commands(session_name)
         self.refresh_cli_session_files(session_name, chat_id)
@@ -684,6 +697,10 @@ class TmuxSessionRuntime:
     def paste_and_submit(self, session_name: str, text: str) -> None:
         with self._session_lock(session_name):
             self.dismiss_claude_feedback_prompt_if_visible(session_name)
+            if self.dismiss_claude_resume_prompt_if_visible(session_name):
+                # Give the resumed session a moment to load before pasting,
+                # so the message lands in the input box, not the menu.
+                time.sleep(2)
             LOGGER.info("paste_and_submit to %s (%d chars)", session_name, len(text))
             with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
                 handle.write(text)
@@ -717,6 +734,67 @@ class TmuxSessionRuntime:
             check=False,
         )
         return True
+
+    _RESUME_PROMPT_MARKERS = ("Resume from summary", "Resume full session")
+
+    def dismiss_claude_resume_prompt_if_visible(
+        self,
+        session_name: str,
+        screen: str | None = None,
+    ) -> bool:
+        """Claude shows a 'Resume from summary / Resume full session' picker
+        when resuming a large conversation. Unattended resumes must never
+        stall on it (and pasted messages must not be typed into the menu),
+        so auto-select option 1: Resume from summary (recommended)."""
+        if self.agent != "claude":
+            return False
+        if screen is None:
+            try:
+                screen = self.capture(session_name)
+            except subprocess.CalledProcessError:
+                return False
+        if not any(marker in screen for marker in self._RESUME_PROMPT_MARKERS):
+            return False
+        LOGGER.info("resume prompt visible in %s; selecting 'Resume from summary'", session_name)
+        subprocess.run(
+            ["tmux", "send-keys", "-t", session_name, "1"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        time.sleep(0.5)
+        subprocess.run(
+            ["tmux", "send-keys", "-t", session_name, "Enter"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        return True
+
+    def _migrate_claude_transcript(self, session_uuid: str, new_workspace: Path) -> bool:
+        """Claude stores conversations under per-cwd project dirs. Move the
+        transcript into the new workspace's project dir so that
+        `claude --resume <uuid>` finds it after a workspace change."""
+        if self.agent != "claude":
+            return False
+        from .transcripts import encode_claude_project_dir, find_claude_session_file
+
+        projects_root = Path.home() / ".claude" / "projects"
+        target_dir = projects_root / encode_claude_project_dir(new_workspace)
+        target = target_dir / f"{session_uuid}.jsonl"
+        if target.exists():
+            return True
+        source = find_claude_session_file(projects_root, session_uuid)
+        if not source:
+            return False
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            os.replace(source, target)
+            LOGGER.info("migrated claude transcript %s -> %s", source, target)
+            return True
+        except OSError as exc:
+            LOGGER.warning("claude transcript migration failed: %s", exc)
+            return False
 
     def apply_startup_commands(self, session_name: str) -> None:
         if self.agent != "codex":

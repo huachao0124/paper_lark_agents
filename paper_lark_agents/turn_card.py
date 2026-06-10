@@ -175,20 +175,34 @@ class TurnCardManager:
                     with self._lock:
                         card.message_id = new.message_id
                     return
-        # Accumulate progress for plain cards so users see all steps, not
-        # just the latest one.
+        # Accumulate step headers for plain cards. Each detail typically has
+        # a one-line activity header (step/tok counts, changes each tick) plus
+        # a multi-line body (agent's latest text, often repeated across ticks).
+        # We accumulate unique headers and show the latest body once at the end.
         acc_key = card.message_id
+        lines = detail.split("\n", 1)
+        header = lines[0].strip()
+        body = lines[1].strip() if len(lines) > 1 else ""
         with self._lock:
-            prev = self._accumulated.get(acc_key, "")
-            if prev and detail not in prev:
-                combined = f"{prev}\n{detail}"
-                # Cap to avoid hitting Feishu card size limits.
-                if len(combined) > 3000:
-                    combined = combined[-3000:]
-                self._accumulated[acc_key] = combined
-            else:
-                combined = detail
-                self._accumulated[acc_key] = combined
+            history = self._accumulated.get(acc_key)
+            if not isinstance(history, dict):
+                history = {"headers": [], "seen": set()}
+                self._accumulated[acc_key] = history
+            if header and header not in history["seen"]:
+                history["headers"].append(header)
+                history["seen"].add(header)
+                # Keep at most 20 header lines.
+                if len(history["headers"]) > 20:
+                    removed = history["headers"].pop(0)
+                    history["seen"].discard(removed)
+            header_block = "\n".join(history["headers"])
+        if body:
+            combined = f"{header_block}\n\n{body}"
+        else:
+            combined = header_block
+        # Cap total length.
+        if len(combined) > 3000:
+            combined = combined[-3000:]
         self._update_plain(card, combined)
 
     def finalize(self, card: TurnCard, state: str, body: str) -> bool:

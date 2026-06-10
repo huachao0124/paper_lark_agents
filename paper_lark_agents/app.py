@@ -2735,6 +2735,8 @@ _SCREEN_ERROR_PATTERNS = [
     "ETIMEDOUT",
     "network error",
     "connection reset",
+    "Usage Policy",
+    "unable to respond",
 ]
 
 

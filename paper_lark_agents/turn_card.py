@@ -359,31 +359,32 @@ class TurnCardManager:
         self._delete_message(old_msg)
 
     def _interrupt_card(self, card: TurnCard) -> None:
+        # Finalize the old card as "done" with whatever accumulated content it
+        # had. Feishu card PATCH cannot change the header colour/title, so we
+        # delete the old message and send a fresh terminal card. This is one
+        # withdrawal per interrupt, but unavoidable — leaving a blue "Running"
+        # header on screen when the turn is over is worse.
         if card.card_id and card.strategy == "streaming":
             try:
                 self._lark.finalize_streaming_card(
                     card.card_id,
-                    title=f"{card.agent_name} · Interrupted",
-                    template="grey",
+                    title=f"{card.agent_name} · Done",
+                    template="green",
                     sequence=card.sequence + 1,
                 )
                 return
             except Exception:
                 pass
-        # Update the card in place to "Interrupted" instead of deleting it.
-        # Deleting causes "撤回了一条消息" and leaves progress threads holding
-        # stale message_ids that trigger dead-card recovery (duplicate cards).
-        if card.message_id:
-            interrupted = turn_reply_card(
-                card.agent_name, "skipped", "—",
-                model=card.model, effort=card.effort, started_at=card.started_at,
-            )
-            try:
-                self._lark.update_card(card.message_id, interrupted)
-                return
-            except Exception:
-                pass
+        # Plain card: header can't be patched, so delete + send terminal card.
+        acc_key = card.message_id
+        with self._lock:
+            history = self._accumulated.get(acc_key)
+            if isinstance(history, dict) and history.get("headers"):
+                body = "\n".join(history["headers"])
+            else:
+                body = "—"
         self._delete_message(card.message_id)
+        self._send_terminal_card(card, "done", body)
 
     def _delete_message(self, message_id: str) -> None:
         if not message_id:

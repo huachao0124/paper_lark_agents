@@ -102,7 +102,11 @@ class LarkSDK:
         return results
 
     def send_image(self, chat_id: str, image_path: str) -> dict[str, Any]:
-        with open(image_path, "rb") as f:
+        try:
+            f = open(image_path, "rb")
+        except OSError as exc:
+            raise LarkCLIError(f"cannot read image {image_path}: {exc}") from exc
+        with f:
             upload_body = (
                 CreateImageRequestBody.builder()
                 .image_type("message")
@@ -137,7 +141,11 @@ class LarkSDK:
     def send_file(self, chat_id: str, file_path: str) -> dict[str, Any]:
         suffix = Path(file_path).suffix.lower()
         file_type = _FILE_TYPE_MAP.get(suffix, "stream")
-        with open(file_path, "rb") as f:
+        try:
+            f = open(file_path, "rb")
+        except OSError as exc:
+            raise LarkCLIError(f"cannot read file {file_path}: {exc}") from exc
+        with f:
             upload_body = (
                 CreateFileRequestBody.builder()
                 .file_type(file_type)

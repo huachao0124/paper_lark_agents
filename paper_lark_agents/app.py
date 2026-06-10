@@ -2555,12 +2555,20 @@ class PaperAgentBridge:
                 f"Uploading {len(artifacts)} artifact(s): {names}{suffix}",
             )
         failures: list[str] = []
+        # upload_path is relative to the relay base_cwd — a lark-cli cwd
+        # convention. The SDK opens files from the bridge process cwd, so
+        # give it the absolute path.
+        sdk_mode = hasattr(self.lark, "_client")
         for artifact in artifacts:
+            upload = (
+                str(relay.base_cwd / artifact.upload_path) if sdk_mode
+                else artifact.upload_path
+            )
             try:
                 if artifact.kind == "image":
-                    result = self.lark.send_image(chat_id, artifact.upload_path)
+                    result = self.lark.send_image(chat_id, upload)
                 else:
-                    result = self.lark.send_file(chat_id, artifact.upload_path)
+                    result = self.lark.send_file(chat_id, upload)
                 message_id = first_field(result, "message_id")
                 if message_id:
                     self.outbox.remember_message_id(
@@ -2569,7 +2577,9 @@ class PaperAgentBridge:
                         agent=self.settings.agent_mode,
                         discussion_trigger=False,
                     )
-            except LarkCLIError as exc:
+            except Exception as exc:
+                # Artifact upload is best-effort decoration — it must never
+                # crash the dispatch tail (the reply itself is already sent).
                 LOGGER.warning("artifact upload failed for %s: %s", artifact.path, exc)
                 failures.append(artifact.name)
         if failures:

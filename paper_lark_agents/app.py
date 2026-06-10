@@ -701,7 +701,7 @@ class PaperAgentBridge:
                 )
                 return
             route = gated
-        LOGGER.info("handling %s from %s", route.kind, event.sender_id)
+        LOGGER.info("handling %s from %s (text=%r)", route.kind, event.sender_id, (route.text or event.content)[:120])
         try:
             reply = self.dispatch(route, event, source_agent=source_agent)
         except (AgentError, LarkCLIError) as exc:
@@ -1127,16 +1127,32 @@ class PaperAgentBridge:
 
         return self.run_session_command_with_status(agent, chat_id, command, workspace)
 
+    @staticmethod
+    def _strip_feishu_markdown(text: str) -> str:
+        """Feishu auto-wraps URLs as [display](url) and percent-encodes
+        shell metacharacters inside hrefs. Restore plain text so shell
+        commands pasted into tmux work as the user typed them."""
+        from urllib.parse import unquote
+        # Prefer the display text when it looks like a raw URL (starts with
+        # http/ftp/ssh); fall back to the href (unquote percent-encoding).
+        def _pick(m: re.Match) -> str:
+            display, href = m.group(1), m.group(2)
+            if display.startswith(("http", "ftp", "ssh", "git@")):
+                return display
+            return unquote(href)
+        return re.sub(r'\[([^\]]*)\]\(([^)]+)\)', _pick, text)
+
     def handle_shell_command(self, agent: str, chat_id: str, command: str) -> str:
         """Paste `! <cmd>` into the agent's tmux session verbatim — no
         wrap_prompt, no Message: prefix, no context block.  The leading `!`
         triggers the agent CLI's native shell mode.  The bridge waits for the
         reply via the normal JSONL transcript path."""
+        command = self._strip_feishu_markdown(command.strip())
         workspace = self.chat_workspace(chat_id)
         runtime = self.agents.claude_session if agent == "claude" else self.agents.codex_session
         session_name = runtime.session_name(chat_id)
         runtime.ensure_session(session_name, chat_id, workspace)
-        runtime.paste_and_submit(session_name, command.strip())
+        runtime.paste_and_submit(session_name, command)
         return ""
 
     def run_session_command_with_status(

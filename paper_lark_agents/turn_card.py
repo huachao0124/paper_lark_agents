@@ -29,6 +29,7 @@ class TurnCard:
     card_id: str | None = None
     sequence: int = 0
     strategy: str = "plain"
+    stream_expired: bool = False
 
 
 class TurnCardManager:
@@ -151,16 +152,14 @@ class TurnCardManager:
                 else:
                     combined = detail
                 self._accumulated[acc_key] = combined
+            if card.stream_expired:
+                return
             try:
                 self._lark.stream_card_content(card_id, combined, sequence=seq)
                 return
             except Exception as exc:
-                LOGGER.warning("streaming update failed for %s: %s", card_id, exc)
-                # Streaming content channel timed out (10-min server limit).
-                # Do NOT renew/downgrade/delete — the card entity is still
-                # alive; finalize_streaming_card (different API) will still
-                # change the header from Running→Done. Just stop pushing
-                # content updates; the card freezes at its last state.
+                LOGGER.warning("streaming update failed for %s, muting further attempts: %s", card_id, exc)
+                card.stream_expired = True
                 return
         # Accumulate step headers for plain cards. Each detail typically has
         # a one-line activity header (step/tok counts, changes each tick) plus

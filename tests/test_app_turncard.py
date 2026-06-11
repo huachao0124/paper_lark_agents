@@ -90,8 +90,9 @@ class TurnCardTests(unittest.TestCase):
             route = Route("agent", text="q", agent="codex")
             b.finalize_turn_reply(card, route, event(), "这是答案", source_agent=None, handoff_depth=0)
             # TurnCardManager.finalize sends a terminal card for plain strategy
-            self.assertTrue(b.lark.updates or b.lark.cards)
-            self.assertIn("这是答案", card_text(b.lark.cards[-1][1]))
+            finalized = b.lark.updates or b.lark.cards
+            self.assertTrue(finalized)
+            self.assertIn("这是答案", card_text(finalized[-1][1]))
             self.assertIn("这是答案", b.memory.context("oc_a"))
             self.assertEqual(b.lark.markdowns, [])  # no overflow
 

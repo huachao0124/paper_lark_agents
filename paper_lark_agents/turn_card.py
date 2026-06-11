@@ -236,6 +236,12 @@ class TurnCardManager:
             except Exception as exc:
                 LOGGER.warning("streaming finalize failed for %s: %s", card.card_id, exc)
                 self._delete_message(card.message_id)
+        # Plain card: header (title+colour) can't be changed via PATCH, so
+        # delete the Running message and send a fresh terminal card with the
+        # correct green/red header.
+        old_msg = card.message_id
+        if old_msg:
+            self._delete_message(old_msg)
         return self._send_terminal_card(card, state, body)
 
     def send_done_card(

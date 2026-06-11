@@ -1103,6 +1103,14 @@ class PaperAgentBridge:
         command = command.strip()
         if not command:
             return "Please provide a session command."
+        # Dedup: Feishu can deliver the same event twice; skip if we just
+        # handled this exact command for this agent+chat within 5 seconds.
+        dedup_key = f"session_cmd:{agent}:{chat_id}:{command}"
+        now = time.time()
+        last = self._pending_status_updates.get(dedup_key)
+        if last and now - last < 5:
+            return ""
+        self._pending_status_updates[dedup_key] = now
         workspace = self.chat_workspace(chat_id)
 
         try:

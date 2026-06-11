@@ -1151,6 +1151,7 @@ class PaperAgentBridge:
             agent_name = self.agent_display_name(agent)
             if sent:
                 return f"{agent_name} `/model {model}` 已发送，等待确认。"
+            return f"{agent_name} model 已记为 `{model}`，会话当前忙碌，下轮空闲时自动生效。"
 
         return self.run_session_command_with_status(agent, chat_id, command, workspace)
 
@@ -1259,7 +1260,7 @@ class PaperAgentBridge:
             effort=effort,
         )
         if not sent:
-            return f"{agent_name} 不在 session 模式，无法发送：`{preview}`"
+            return f"{agent_name} 会话当前忙碌，无法发送：`{preview}`，请稍后重试。"
         # Commands that produce output (like /deep-research) need a card +
         # JSONL monitoring, just like a normal agent turn. Settings-only
         # commands (/effort, /model) are handled before reaching here.

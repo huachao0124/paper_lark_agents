@@ -300,7 +300,10 @@ class LarkSDK:
         footer: str | None = None,
     ) -> None:
         if final_content is not None:
-            self.stream_card_content(card_id, final_content, sequence=sequence)
+            try:
+                self.stream_card_content(card_id, final_content, sequence=sequence)
+            except LarkCLIError:
+                pass  # streaming channel timed out; body goes via PUT below
             sequence += 1
         # Disable streaming mode
         request = (

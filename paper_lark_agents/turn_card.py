@@ -222,22 +222,8 @@ class TurnCardManager:
                 return True
             except Exception as exc:
                 LOGGER.warning("streaming finalize failed for %s: %s", card.card_id, exc)
-                # stream_card_content (final_content push) likely failed because
-                # streaming timed out. Retry without content push — the PUT card
-                # changes the header. Then patch the body via plain update_card.
-                try:
-                    self._lark.finalize_streaming_card(
-                        card.card_id,
-                        title=title,
-                        template=template,
-                        sequence=card.sequence + 1,
-                        footer=footer,
-                    )
-                except Exception:
-                    pass
-                # Whether or not the header changed, write the body via plain
-                # PATCH so the Done card is never empty.
-                # (falls through to the plain update_card block below)
+                # PATCH settings or PUT card failed — fall through to plain
+                # update_card as last resort.
         # Plain card: update in place — PATCH can change both header and body.
         if card.message_id:
             done = turn_reply_card(

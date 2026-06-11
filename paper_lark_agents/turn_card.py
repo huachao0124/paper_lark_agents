@@ -97,12 +97,7 @@ class TurnCardManager:
                 LOGGER.info("interrupting old card %s for %s", old.message_id[:12], key)
                 self._interrupt_card(old)
             if strategy == "auto":
-                # Streaming cards have a 10-min server-side timeout. For long-
-                # running agent turns the card gets killed and must be renewed
-                # (deleting the old message each time — users see repeated
-                # withdrawals). Use plain cards instead — they can be updated
-                # indefinitely.
-                strategy = "plain"
+                strategy = "streaming" if self._supports_streaming() else "plain"
             card = self._create_card(chat_id, agent, agent_name, model, effort, strategy)
         finally:
             # Always release the creation guard — a leaked key would block
@@ -161,20 +156,12 @@ class TurnCardManager:
                 return
             except Exception as exc:
                 LOGGER.warning("streaming update failed for %s: %s", card_id, exc)
-                if self._renew_streaming_card(card, detail, seq):
-                    # Renewal already streamed the detail to the new card —
-                    # falling through would im-PATCH the streaming message
-                    # (230099), killing the card we just created.
-                    return
-                self._downgrade_to_plain(card)
-                new = self._create_card(
-                    card.chat_id, card.agent, card.agent_name,
-                    card.model, card.effort, "plain",
-                )
-                if new:
-                    with self._lock:
-                        card.message_id = new.message_id
-                    return
+                # Streaming content channel timed out (10-min server limit).
+                # Do NOT renew/downgrade/delete — the card entity is still
+                # alive; finalize_streaming_card (different API) will still
+                # change the header from Running→Done. Just stop pushing
+                # content updates; the card freezes at its last state.
+                return
         # Accumulate step headers for plain cards. Each detail typically has
         # a one-line activity header (step/tok counts, changes each tick) plus
         # a multi-line body (agent's latest text, often repeated across ticks).
@@ -235,13 +222,30 @@ class TurnCardManager:
                 return True
             except Exception as exc:
                 LOGGER.warning("streaming finalize failed for %s: %s", card.card_id, exc)
-                self._delete_message(card.message_id)
-        # Plain card: header (title+colour) can't be changed via PATCH, so
-        # delete the Running message and send a fresh terminal card with the
-        # correct green/red header.
-        old_msg = card.message_id
-        if old_msg:
-            self._delete_message(old_msg)
+                # Finalize API failed — try a second attempt without final_content
+                # (the content push may have been what failed).
+                try:
+                    self._lark.finalize_streaming_card(
+                        card.card_id,
+                        title=title,
+                        template=template,
+                        sequence=card.sequence + 1,
+                        footer=footer,
+                    )
+                    return True
+                except Exception:
+                    pass
+        # Plain card: update in place — PATCH can change both header and body.
+        if card.message_id:
+            done = turn_reply_card(
+                card.agent_name, state, body,
+                model=card.model, effort=card.effort, started_at=card.started_at,
+            )
+            try:
+                self._lark.update_card(card.message_id, done)
+                return True
+            except Exception as exc:
+                LOGGER.warning("plain card finalize failed for %s: %s", card.message_id, exc)
         return self._send_terminal_card(card, state, body)
 
     def send_done_card(
@@ -381,16 +385,25 @@ class TurnCardManager:
                 return
             except Exception:
                 pass
-        # Plain card: header can't be patched, so delete + send terminal card.
-        acc_key = card.message_id
-        with self._lock:
-            history = self._accumulated.get(acc_key)
-            if isinstance(history, dict) and history.get("headers"):
-                body = "\n".join(history["headers"])
-            else:
-                body = "—"
+        # Plain card: update in place to Done.
+        if card.message_id:
+            acc_key = card.message_id
+            with self._lock:
+                history = self._accumulated.get(acc_key)
+                if isinstance(history, dict) and history.get("headers"):
+                    body = "\n".join(history["headers"])
+                else:
+                    body = "—"
+            done = turn_reply_card(
+                card.agent_name, "done", body,
+                model=card.model, effort=card.effort, started_at=card.started_at,
+            )
+            try:
+                self._lark.update_card(card.message_id, done)
+                return
+            except Exception:
+                pass
         self._delete_message(card.message_id)
-        self._send_terminal_card(card, "done", body)
 
     def _delete_message(self, message_id: str) -> None:
         if not message_id:

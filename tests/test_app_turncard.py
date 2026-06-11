@@ -77,8 +77,9 @@ class TurnCardTests(unittest.TestCase):
             b._dashboard_lark = dashboard  # distinct identity, as in serve-duo
             card = b.cards.acquire("oc_a", "codex", "Codex", "gpt", "xhigh")
             b.cards.finalize(card, "done", "答案")
-            # acquire sends 1 card, finalize sends another (terminal card)
-            self.assertEqual(len(b.lark.cards), 2)        # sent under own identity
+            # acquire sends 1 card, finalize updates it in place
+            self.assertEqual(len(b.lark.cards), 1)        # sent under own identity
+            self.assertTrue(b.lark.updates)               # finalize updates in place
             self.assertEqual(dashboard.cards, [])         # never touched the dashboard profile
             self.assertEqual(dashboard.updates, [])
 
@@ -89,7 +90,7 @@ class TurnCardTests(unittest.TestCase):
             route = Route("agent", text="q", agent="codex")
             b.finalize_turn_reply(card, route, event(), "这是答案", source_agent=None, handoff_depth=0)
             # TurnCardManager.finalize sends a terminal card for plain strategy
-            self.assertTrue(b.lark.cards)
+            self.assertTrue(b.lark.updates or b.lark.cards)
             self.assertIn("这是答案", card_text(b.lark.cards[-1][1]))
             self.assertIn("这是答案", b.memory.context("oc_a"))
             self.assertEqual(b.lark.markdowns, [])  # no overflow
@@ -99,8 +100,8 @@ class TurnCardTests(unittest.TestCase):
             b = self.bridge(Path(tmp))
             card = TurnCard("card_1", "oc_a", "codex", "Codex", "gpt", "xhigh", 0.0)
             b.finalize_turn_reply(card, Route("agent", text="q", agent="codex"), event(), "[NO_REPLY]", source_agent=None, handoff_depth=0)
-            # TurnCardManager.finalize sends a terminal card for skipped state
-            self.assertTrue(b.lark.cards)
+            # TurnCardManager.finalize updates the card in place (or sends a new one)
+            self.assertTrue(b.lark.updates or b.lark.cards)
             self.assertEqual(b.memory.context("oc_a"), "No previous discussion in this Feishu group yet.")
 
     def test_no_reply_with_explanation_is_still_no_reply(self):
@@ -113,8 +114,10 @@ class TurnCardTests(unittest.TestCase):
                 source_agent=None, handoff_depth=0,
             )
             # Should be treated as no-reply, not shown as "Done" with the text.
-            self.assertTrue(b.lark.cards)
-            self.assertNotIn("[NO_REPLY]", card_text(b.lark.cards[-1][1]))
+            finalized = b.lark.updates or b.lark.cards
+            self.assertTrue(finalized)
+            last_card = finalized[-1][1] if finalized else {}
+            self.assertNotIn("[NO_REPLY]", card_text(last_card))
             self.assertEqual(b.memory.context("oc_a"), "No previous discussion in this Feishu group yet.")
 
     def test_finalize_long_answer_overflows_to_markdown(self):
@@ -124,8 +127,8 @@ class TurnCardTests(unittest.TestCase):
             long_answer = "甲" * (limit + 500)
             card = TurnCard("card_1", "oc_a", "codex", "Codex", "gpt", "xhigh", 0.0)
             b.finalize_turn_reply(card, Route("agent", text="q", agent="codex"), event(), long_answer, source_agent=None, handoff_depth=0)
-            self.assertTrue(b.lark.cards)                 # head in card
-            self.assertEqual(len(b.lark.markdowns), 1)    # tail overflowed to a message
+            self.assertTrue(b.lark.updates or b.lark.cards)  # head in card
+            self.assertEqual(len(b.lark.markdowns), 1)       # tail overflowed to a message
 
     def test_finalize_at_peer_queues_handoff(self):
         with tempfile.TemporaryDirectory() as tmp:

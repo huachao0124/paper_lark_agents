@@ -489,6 +489,15 @@ class PaperAgentBridge:
             error = _detect_screen_error(screen)
             if error:
                 detail = f"⚠️ {error}\n\n{detail}"
+                error_key = f"{run.agent}:{run.chat_id}:screen_error"
+                last = self._pending_status_updates.get(error_key)
+                if not last or time.time() - last > 120:
+                    self._pending_status_updates[error_key] = time.time()
+                    self.send_progress_markdown(
+                        run.chat_id,
+                        f"⚠️ **{self.agent_display_name(run.agent)}** 遇到错误:\n`{error}`\n\n"
+                        f"请换个措辞重试,或发 `/clear` 重置会话。",
+                    )
             self._check_interactive_prompt(run.agent, run.chat_id, session_name, screen)
         except Exception:
             pass

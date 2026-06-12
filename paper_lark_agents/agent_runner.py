@@ -34,6 +34,59 @@ class AgentRunner:
         claude_sid = f"claude-{suffix}" if suffix else None
         self.codex_session = TmuxSessionRuntime(settings, "codex", session_id=codex_sid)
         self.claude_session = TmuxSessionRuntime(settings, "claude", session_id=claude_sid)
+        # GPT-Pro as an isolated codex session (separate CODEX_HOME + internal
+        # API key), so it has codex's tools without touching the subscription
+        # codex session. Only built when PLA_GPT_PRO_RUNTIME=codex.
+        self.gptpro_session: TmuxSessionRuntime | None = None
+        if settings.gpt_pro_runtime == "codex":
+            from .gpt_pro_agent import build_internal_api_key
+            gptpro_sid = f"gptpro-{suffix}" if suffix else "gptpro"
+            extra_env: dict[str, str] = {}
+            if settings.gpt_pro_codex_home:
+                extra_env["CODEX_HOME"] = settings.gpt_pro_codex_home
+            if settings.gpt_pro_user and settings.gpt_pro_token:
+                extra_env["INTERNAL_GPTPRO_KEY"] = build_internal_api_key(
+                    settings.gpt_pro_user, settings.gpt_pro_token, settings.gpt_pro_model,
+                    settings.gpt_pro_task_creator, settings.gpt_pro_task_name,
+                )
+            self.gptpro_session = TmuxSessionRuntime(
+                settings, "codex", session_id=gptpro_sid, extra_env=extra_env,
+            )
+
+    def run_gpt_pro(
+        self,
+        prompt: str,
+        chat_id: str | None = None,
+        session_context: str | None = None,
+        workspace: Path | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+        progress_callback: Callable[[str], None] | None = None,
+        run_id: str | None = None,
+    ) -> AgentResult:
+        """Run GPT-Pro as an isolated codex session (internal API)."""
+        if not self.gptpro_session:
+            raise AgentError("GPT-Pro codex runtime not initialized.")
+        if not chat_id:
+            raise AgentError("GPT-Pro session runtime requires chat_id.")
+        try:
+            reply = self.gptpro_session.run(
+                chat_id,
+                prompt,
+                self.settings.codex_timeout,
+                session_context=session_context,
+                workspace=workspace,
+                model=model,
+                effort=effort,
+                progress_callback=progress_callback,
+                progress_interval=self.settings.status_update_seconds,
+                run_id=run_id,
+            )
+        except TmuxReplyStillRunning as exc:
+            raise AgentStillRunning(str(exc)) from exc
+        except (TmuxRuntimeError, subprocess.CalledProcessError, FileNotFoundError) as exc:
+            raise AgentError(str(exc)) from exc
+        return AgentResult("GPT-Pro", reply.text, reply.usage, reply.transcript_path, reply.transcript_offset)
 
     def run_codex(
         self,
@@ -193,11 +246,33 @@ class AgentRunner:
             raise AgentError(str(exc)) from exc
         return session_name, needs_init
 
+    def runtime_for(self, agent: str) -> "TmuxSessionRuntime":
+        """Map an agent to its session runtime (pure mapping, no mode check).
+        Used by recovery/interactive paths that already assume session mode."""
+        if agent == "gpt-pro":
+            return self.gptpro_session or self.codex_session
+        if agent == "claude":
+            return self.claude_session
+        return self.codex_session
+
+    def _session_for(self, agent: str) -> "TmuxSessionRuntime | None":
+        """Return the active session runtime for an agent, or None if that
+        agent is not running in session mode."""
+        if agent == "codex":
+            return self.codex_session if self.settings.codex_runtime == "session" else None
+        if agent == "claude":
+            return self.claude_session if self.settings.claude_runtime == "session" else None
+        if agent == "gpt-pro":
+            return self.gptpro_session  # None unless PLA_GPT_PRO_RUNTIME=codex
+        return None
+
     def session_name(self, agent: str, chat_id: str) -> str:
         if agent == "codex":
             return self.codex_session.session_name(chat_id)
         if agent == "claude":
             return self.claude_session.session_name(chat_id)
+        if agent == "gpt-pro" and self.gptpro_session:
+            return self.gptpro_session.session_name(chat_id)
         raise AgentError(f"Unknown agent: {agent}")
 
     def reply_markers(self, agent: str, run_id: str) -> tuple[str, str]:
@@ -205,6 +280,8 @@ class AgentRunner:
             return self.codex_session.reply_markers(run_id)
         if agent == "claude":
             return self.claude_session.reply_markers(run_id)
+        if agent == "gpt-pro" and self.gptpro_session:
+            return self.gptpro_session.reply_markers(run_id)
         raise AgentError(f"Unknown agent: {agent}")
 
     def find_session_reply(
@@ -214,52 +291,31 @@ class AgentRunner:
         start_marker: str,
         end_marker: str,
     ) -> str | None:
-        if agent == "codex":
-            if self.settings.codex_runtime != "session":
-                return None
-            runtime = self.codex_session
-        elif agent == "claude":
-            if self.settings.claude_runtime != "session":
-                return None
-            runtime = self.claude_session
-        else:
-            raise AgentError(f"Unknown agent: {agent}")
+        runtime = self._session_for(agent)
+        if runtime is None:
+            return None
         try:
             return runtime.find_marked_reply(chat_id, start_marker, end_marker)
         except (subprocess.CalledProcessError, FileNotFoundError) as exc:
             raise AgentError(str(exc)) from exc
 
     def reset_session(self, agent: str, chat_id: str) -> list[Path]:
-        if agent == "codex":
-            if self.settings.codex_runtime == "session":
-                return self.codex_session.reset_session(chat_id)
+        runtime = self._session_for(agent)
+        if runtime is None:
             return []
-        if agent == "claude":
-            if self.settings.claude_runtime == "session":
-                return self.claude_session.reset_session(chat_id)
-            return []
-        raise AgentError(f"Unknown agent: {agent}")
+        return runtime.reset_session(chat_id)
 
     def detect_session_model(self, agent: str, chat_id: str) -> str | None:
-        if agent == "codex" and self.settings.codex_runtime == "session":
-            return self.codex_session.detect_model(chat_id)
-        if agent == "claude" and self.settings.claude_runtime == "session":
-            return self.claude_session.detect_model(chat_id)
-        return None
+        runtime = self._session_for(agent)
+        return runtime.detect_model(chat_id) if runtime else None
 
     def detect_session_effort(self, agent: str, chat_id: str) -> str | None:
-        if agent == "codex" and self.settings.codex_runtime == "session":
-            return self.codex_session.detect_effort(chat_id)
-        if agent == "claude" and self.settings.claude_runtime == "session":
-            return self.claude_session.detect_effort(chat_id)
-        return None
+        runtime = self._session_for(agent)
+        return runtime.detect_effort(chat_id) if runtime else None
 
     def session_progress(self, agent: str, chat_id: str) -> str | None:
-        if agent == "codex" and self.settings.codex_runtime == "session":
-            return self.codex_session.session_progress(chat_id)
-        if agent == "claude" and self.settings.claude_runtime == "session":
-            return self.claude_session.session_progress(chat_id)
-        return None
+        runtime = self._session_for(agent)
+        return runtime.session_progress(chat_id) if runtime else None
 
     def _run(
         self,

@@ -37,25 +37,36 @@ class GptProConfig:
     )
 
 
-def _make_client(config: GptProConfig):
-    from openai import OpenAI
-    import httpx
-
+def build_internal_api_key(
+    user: str, token: str, model: str,
+    task_creator: str = "arimazhu", task_name: str = "debug", timeout: int = 6000,
+) -> str:
+    """Construct the internal-platform API key string (used both by the direct
+    OpenAI client and as the env_key value for a codex provider)."""
     extension = {
-        "task_creator": config.task_creator,
+        "task_creator": task_creator,
         "task_id": "",
-        "task_name": config.task_name,
+        "task_name": task_name,
         "task_source": "9",
         "caller_token": "",
     }
     extra_encoded = urllib.parse.quote(json.dumps(extension, ensure_ascii=False))
-    # The API key encodes provider + model (real upstream name, NOT the
-    # -passthrough alias) + usage flags.
-    api_key = (
-        f"{config.user}:{config.token}"
-        f"?provider=openai&timeout={config.timeout}"
-        f"&model={config.model}&usage=1"
+    # provider + model (real upstream name, NOT the -passthrough alias) + flags.
+    return (
+        f"{user}:{token}"
+        f"?provider=openai&timeout={timeout}"
+        f"&model={model}&usage=1"
         f"&extra={extra_encoded}"
+    )
+
+
+def _make_client(config: GptProConfig):
+    from openai import OpenAI
+    import httpx
+
+    api_key = build_internal_api_key(
+        config.user, config.token, config.model,
+        config.task_creator, config.task_name, config.timeout,
     )
     base_url = f"http://{config.host}/v1"
     return OpenAI(

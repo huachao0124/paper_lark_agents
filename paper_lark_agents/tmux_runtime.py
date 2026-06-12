@@ -67,13 +67,23 @@ class TmuxReply:
 class TmuxSessionRuntime:
     def __init__(
         self, settings: Settings, agent: str, session_id: str | None = None,
+        extra_env: dict[str, str] | None = None,
     ):
         self.settings = settings
         self.agent = agent
         self.session_id = session_id or agent
+        # Extra environment injected into the agent CLI process (e.g. a separate
+        # CODEX_HOME + API key so a gpt-pro codex session is fully isolated from
+        # the subscription codex session).
+        self.extra_env = extra_env or {}
         self._chat_labels: dict[str, str] = {}
         self._session_locks: dict[str, threading.Lock] = {}
         self._session_locks_guard = threading.Lock()
+
+    def _env_prefix(self) -> list[str]:
+        if not self.extra_env:
+            return []
+        return ["env", *[f"{k}={v}" for k, v in self.extra_env.items()]]
 
     def run(
         self,
@@ -316,6 +326,7 @@ class TmuxSessionRuntime:
             args.extend(["-C", str(workspace)])
             command = [self.settings.codex_cmd, *args]
             return [
+                *self._env_prefix(),
                 *proxy_command_prefix(self.settings.agent_proxy_url, self.settings.no_proxy),
                 *command,
             ]
@@ -323,6 +334,7 @@ class TmuxSessionRuntime:
         args = with_model_arg(args, self.settings.claude_model, "--model")
         command = [self.settings.claude_cmd, *args]
         return [
+            *self._env_prefix(),
             *proxy_command_prefix(self.settings.agent_proxy_url, self.settings.no_proxy),
             *command,
         ]

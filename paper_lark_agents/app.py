@@ -294,6 +294,8 @@ class PaperAgentBridge:
             if chat_id and name:
                 self.agents.codex_session.set_chat_label(chat_id, name)
                 self.agents.claude_session.set_chat_label(chat_id, name)
+                if self.agents.gptpro_session:
+                    self.agents.gptpro_session.set_chat_label(chat_id, name)
 
     def start_handoff_worker(self, stop_event: threading.Event) -> threading.Thread | None:
         if not self.settings.enable_agent_discussion or not self.settings.direct_agent_handoff:
@@ -322,7 +324,7 @@ class PaperAgentBridge:
         return worker
 
     def pending_run_agents(self) -> tuple[str, ...]:
-        if self.default_agent in {"codex", "claude"}:
+        if self.default_agent in {"codex", "claude", "gpt-pro"}:
             return (self.default_agent,)
         return self.enabled_agents
 
@@ -381,7 +383,7 @@ class PaperAgentBridge:
             if age > max_age:
                 still_busy = False
                 try:
-                    runtime = self.agents.codex_session if run.agent == "codex" else self.agents.claude_session
+                    runtime = self.agents.runtime_for(run.agent)
                     session_name = runtime.session_name(run.chat_id)
                     if runtime.session_exists(session_name):
                         screen = runtime.capture(session_name)
@@ -472,7 +474,7 @@ class PaperAgentBridge:
             return
         detail = None
         try:
-            runtime = self.agents.codex_session if run.agent == "codex" else self.agents.claude_session
+            runtime = self.agents.runtime_for(run.agent)
             session_name = runtime.session_name(run.chat_id)
             transcript_path = (runtime.read_metadata(session_name) or {}).get("transcript_path")
             if transcript_path and Path(transcript_path).exists():
@@ -485,7 +487,7 @@ class PaperAgentBridge:
             detail = self.agents.session_progress(run.agent, run.chat_id) or "仍在处理,完成后这张卡会更新成回复…"
         # Check tmux screen for errors and interactive prompts.
         try:
-            runtime = self.agents.codex_session if run.agent == "codex" else self.agents.claude_session
+            runtime = self.agents.runtime_for(run.agent)
             session_name = runtime.session_name(run.chat_id)
             screen = runtime.capture(session_name)
             error = _detect_screen_error(screen)
@@ -931,7 +933,7 @@ class PaperAgentBridge:
                     if self.settings.enable_memory:
                         self.memory.append_assistant(event.chat_id, agent, reply)
             return ""
-        if route.kind == "agent" and route.agent == "gpt-pro":
+        if route.kind == "agent" and route.agent == "gpt-pro" and self.settings.gpt_pro_runtime != "codex":
             return self._dispatch_gpt_pro(event, route)
         if route.kind == "agent":
             assert route.agent is not None
@@ -999,7 +1001,14 @@ class PaperAgentBridge:
                         turn_card.model = self.chat_model_label(_chat, _agent)
                         turn_card.effort = self.chat_effort_label(_chat, _agent)
                         self.cards.update(turn_card, detail)
-                    runtime = self.agents.codex_session if _agent == "codex" else self.agents.claude_session
+                    if _agent == "gpt-pro":
+                        runtime = self.agents.gptpro_session
+                    elif _agent == "codex":
+                        runtime = self.agents.codex_session
+                    else:
+                        runtime = self.agents.claude_session
+                    if runtime is None:
+                        return
                     try:
                         sn = runtime.session_name(_chat)
                         screen = runtime.capture(sn)
@@ -1007,7 +1016,18 @@ class PaperAgentBridge:
                     except Exception:
                         pass
 
-                if route.agent == "codex":
+                if route.agent == "gpt-pro":
+                    result = self.agents.run_gpt_pro(
+                        prompt,
+                        event.chat_id,
+                        session_context=session_context,
+                        workspace=workspace,
+                        model=model,
+                        effort=effort,
+                        progress_callback=_progress,
+                        run_id=run_id,
+                    )
+                elif route.agent == "codex":
                     result = self.agents.run_codex(
                         prompt,
                         event.chat_id,
@@ -1183,6 +1203,8 @@ class PaperAgentBridge:
         from .gpt_pro_agent import GptProConfig, call_gpt_pro
 
         s = self.settings
+        if s.gpt_pro_runtime == "codex":
+            return self._dispatch_gpt_pro_session(event, route)
         if not s.gpt_pro_host or not s.gpt_pro_user or not s.gpt_pro_token:
             return "GPT-Pro 未配置（缺少 PLA_GPT_PRO_HOST/USER/TOKEN）。"
 
@@ -1400,7 +1422,7 @@ class PaperAgentBridge:
         if command != raw:
             LOGGER.info("shell_command markdown stripped: %r", command)
         workspace = self.chat_workspace(chat_id)
-        runtime = self.agents.claude_session if agent == "claude" else self.agents.codex_session
+        runtime = self.agents.runtime_for(agent)
         session_name = runtime.session_name(chat_id)
         runtime.ensure_session(session_name, chat_id, workspace)
         # Snapshot screen before pasting so we can diff later.
@@ -1489,7 +1511,7 @@ class PaperAgentBridge:
     ) -> str:
         """Monitor the transcript for the session command's reply, with a turn
         card for live progress — same UX as a normal agent turn."""
-        runtime = self.agents.codex_session if agent == "codex" else self.agents.claude_session
+        runtime = self.agents.runtime_for(agent)
         session_name = runtime.session_name(chat_id)
         turn_card = self.cards.acquire(
             chat_id, agent,
@@ -1987,6 +2009,9 @@ class PaperAgentBridge:
     def agent_runtime(self, agent: str) -> str:
         if agent == "codex":
             return self.settings.codex_runtime
+        if agent == "gpt-pro":
+            # gpt-pro runs as a codex session when PLA_GPT_PRO_RUNTIME=codex.
+            return "session" if self.settings.gpt_pro_runtime == "codex" else "api"
         return self.settings.claude_runtime
 
     def agent_session_context(
@@ -1996,8 +2021,12 @@ class PaperAgentBridge:
         room_memory: str,
         workspace: Path,
     ) -> str:
-        agent_name = "Codex" if agent == "codex" else "Claude Code"
-        peer_name = "Claude" if agent == "codex" else "Codex"
+        if agent == "gpt-pro":
+            agent_name, peer_name = "GPT-Pro", "Codex 和 Claude"
+        elif agent == "codex":
+            agent_name, peer_name = "Codex", "Claude"
+        else:
+            agent_name, peer_name = "Claude Code", "Codex"
         return agent_session_context_prompt(
             agent_name,
             event,
@@ -2033,7 +2062,7 @@ class PaperAgentBridge:
         return None
 
     def agent_timeout(self, agent: str) -> int:
-        if agent == "codex":
+        if agent == "codex" or agent == "gpt-pro":
             return self.settings.codex_timeout
         if agent == "claude":
             return self.settings.claude_timeout
@@ -2306,7 +2335,7 @@ class PaperAgentBridge:
             return
         # Confirm-style dialogs (model switch, folder trust, resume picker)
         # are auto-answered by the bridge — never forward them to Feishu.
-        runtime = self.agents.claude_session if agent == "claude" else self.agents.codex_session
+        runtime = self.agents.runtime_for(agent)
         if runtime.confirm_dialog_visible(screen) or "Resume full session as-is" in screen:
             runtime.auto_confirm_prompt_if_visible(session_name, screen)
             return
@@ -2432,7 +2461,7 @@ class PaperAgentBridge:
 
     def _recover_orphaned_sessions(self) -> None:
         for agent in self.pending_run_agents():
-            runtime = self.agents.codex_session if agent == "codex" else self.agents.claude_session
+            runtime = self.agents.runtime_for(agent)
             live = runtime.list_matching_sessions()
             for session_name in live:
                 meta = runtime.read_metadata(session_name)

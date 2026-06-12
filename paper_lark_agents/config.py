@@ -219,6 +219,8 @@ class Settings:
     gpt_pro_effort: str
     gpt_pro_task_creator: str
     gpt_pro_task_name: str
+    gpt_pro_runtime: str
+    gpt_pro_codex_home: str | None
 
 
 def load_settings(env_file: str | None = ".env") -> Settings:
@@ -335,6 +337,8 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         gpt_pro_effort=os.environ.get("PLA_GPT_PRO_EFFORT", "xhigh"),
         gpt_pro_task_creator=os.environ.get("PLA_GPT_PRO_TASK_CREATOR", "arimazhu"),
         gpt_pro_task_name=os.environ.get("PLA_GPT_PRO_TASK_NAME", "debug"),
+        gpt_pro_runtime=os.environ.get("PLA_GPT_PRO_RUNTIME", "api"),
+        gpt_pro_codex_home=_optional("PLA_GPT_PRO_CODEX_HOME"),
     )
 
 

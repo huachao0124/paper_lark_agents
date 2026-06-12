@@ -24,7 +24,14 @@ class GptProConfig:
     task_creator: str = "arimazhu"
     task_name: str = "debug"
     timeout: int = 600
-    max_context_chars: int = 80000
+    # gpt-5.5-pro has a very large context window; this only bounds the folded
+    # background block so a runaway-long history can't blow up a single request.
+    max_context_chars: int = 400000
+    instructions: str = (
+        "你是 GPT-Pro，一个加入飞书研究群的助手，通过内部 API 平台运行 gpt-5.5-pro。"
+        "群里还有 Codex 和 Claude 两个助手以及用户。只有用户 @ 你时你才会被调用。"
+        "请用中文简洁、专业地回答，给出有依据的判断而不是泛泛而谈。"
+    )
 
 
 def _make_client(config: GptProConfig):
@@ -62,6 +69,7 @@ def call_gpt_pro(config: GptProConfig, messages: list[dict[str, str]]) -> tuple[
     response = client.responses.create(
         model=config.model,
         input=messages,
+        instructions=config.instructions,
         reasoning={"effort": config.effort},
     )
     err = getattr(response, "error", None)
@@ -99,6 +107,7 @@ def stream_gpt_pro(config: GptProConfig, messages: list[dict[str, str]], on_upda
     with client.responses.stream(
         model=config.model,
         input=messages,
+        instructions=config.instructions,
         reasoning={"effort": config.effort, "summary": "auto"},
     ) as stream:
         for event in stream:

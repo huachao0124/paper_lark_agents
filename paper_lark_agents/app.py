@@ -1175,32 +1175,90 @@ class PaperAgentBridge:
             task_name=s.gpt_pro_task_name,
         )
 
-        # Build context: chat history from memory (includes all agents' messages)
-        messages: list[dict[str, str]] = []
-        if self.settings.enable_memory:
-            history = self.memory._read(event.chat_id)
-            for entry in history:
-                role = "assistant" if entry.get("role") == "assistant" else "user"
-                content = entry.get("content", "")
-                if content:
-                    agent = entry.get("agent", "")
-                    if role == "assistant" and agent:
-                        content = f"[{agent}] {content}"
-                    messages.append({"role": role, "content": content})
+        # Build context incrementally: only the conversation since GPT-Pro last
+        # spoke is sent as live turns. Everything before that is folded into one
+        # background summary block so GPT-Pro has context without re-reading the
+        # whole history every time.
+        #
+        # GPT-Pro is a stateless API — it does not remember its own past
+        # replies, so its previous answer is included as the anchor (assistant
+        # role). Other speakers (the user, codex, claude) are all `user` role
+        # with a name prefix, so GPT-Pro never mistakes their words for its own.
+        history = self.memory._read(event.chat_id) if self.settings.enable_memory else []
 
-        # Add the current user message
-        messages.append({"role": "user", "content": route.text or event.content})
+        def is_gpt_pro(entry: dict) -> bool:
+            return entry.get("role") == "assistant" and entry.get("agent") == "gpt-pro"
 
-        # Truncate context to fit token limits (rough char-based estimate)
-        total = 0
-        truncated: list[dict[str, str]] = []
-        for msg in reversed(messages):
-            total += len(msg["content"])
-            if total > config.max_context_chars:
+        # Find the last GPT-Pro reply — the boundary between "background" and
+        # "new since I last spoke".
+        last_gpt_idx = -1
+        for i in range(len(history) - 1, -1, -1):
+            if is_gpt_pro(history[i]):
+                last_gpt_idx = i
                 break
-            truncated.insert(0, msg)
-        if not truncated:
-            truncated = [messages[-1]]
+
+        truncated: list[dict[str, str]] = []
+        if last_gpt_idx >= 0:
+            # Background = everything up to and including GPT-Pro's last reply.
+            bg_lines = []
+            for entry in history[: last_gpt_idx + 1]:
+                content = entry.get("content", "")
+                if not content:
+                    continue
+                if is_gpt_pro(entry):
+                    who = "我(GPT-Pro)"
+                elif entry.get("role") == "assistant":
+                    who = entry.get("agent", "assistant")
+                else:
+                    who = "用户"
+                bg_lines.append(f"{who}: {content}")
+            background = "\n".join(bg_lines)
+            if len(background) > config.max_context_chars:
+                background = "（更早内容略）\n" + background[-config.max_context_chars:]
+            truncated.append({
+                "role": "user",
+                "content": (
+                    "以下是这个飞书群之前的对话背景（你是 GPT-Pro，群里还有 Codex、Claude 两个助手和用户）：\n\n"
+                    f"{background}\n\n"
+                    "下面是你上次回复之后的新对话，请基于全部上下文回答用户最新的问题。"
+                ),
+            })
+            # GPT-Pro's own last reply as the assistant anchor.
+            truncated.append({"role": "assistant", "content": history[last_gpt_idx].get("content", "")})
+            # New messages since then.
+            for entry in history[last_gpt_idx + 1:]:
+                content = entry.get("content", "")
+                if not content:
+                    continue
+                if entry.get("role") == "assistant":
+                    who = entry.get("agent", "assistant")
+                    truncated.append({"role": "user", "content": f"[{who}] {content}"})
+                else:
+                    truncated.append({"role": "user", "content": content})
+        else:
+            # First time GPT-Pro is asked here — give the full history as
+            # background (everyone is `user` so nothing is mistaken as its own).
+            bg_lines = []
+            for entry in history:
+                content = entry.get("content", "")
+                if not content:
+                    continue
+                who = entry.get("agent", "assistant") if entry.get("role") == "assistant" else "用户"
+                bg_lines.append(f"{who}: {content}")
+            if bg_lines:
+                background = "\n".join(bg_lines)
+                if len(background) > config.max_context_chars:
+                    background = "（更早内容略）\n" + background[-config.max_context_chars:]
+                truncated.append({
+                    "role": "user",
+                    "content": (
+                        "以下是这个飞书群的对话背景（你是 GPT-Pro，群里还有 Codex、Claude 两个助手和用户）：\n\n"
+                        f"{background}"
+                    ),
+                })
+
+        # The current @GPT-Pro message.
+        truncated.append({"role": "user", "content": route.text or event.content})
 
         # Show a Running card
         turn_card = None

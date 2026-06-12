@@ -1226,9 +1226,9 @@ class PaperAgentBridge:
             last_push[0] = now
             if kind == "reasoning":
                 reasoning_seen[0] = True
-                body = f"🤔 思考中…\n\n{accumulated[-1500:]}"
+                body = f"🤔 思考中…\n\n{accumulated[-4000:]}"
             else:
-                body = accumulated[-2500:]
+                body = accumulated[-8000:]
             try:
                 self.cards.update(turn_card, body)
             except Exception:
@@ -1245,13 +1245,17 @@ class PaperAgentBridge:
                     self.cards.finalize(turn_card, "failed", f"调用失败：{exc2}")
                 return ""
 
+        # Cards hold far more than a plain message (Feishu card limit ~30KB).
+        # Keep the whole reply in the card; only overflow extremely long
+        # replies to a follow-up message.
+        CARD_LIMIT = 12000
         if turn_card:
             if turn_card.model != model_used:
                 turn_card.model = model_used
-            self.cards.finalize(turn_card, "done", reply[:self.settings.max_message_chars])
-            if len(reply) > self.settings.max_message_chars:
+            self.cards.finalize(turn_card, "done", reply[:CARD_LIMIT])
+            if len(reply) > CARD_LIMIT:
                 self.send_bridge_markdown(
-                    event.chat_id, reply[self.settings.max_message_chars:],
+                    event.chat_id, reply[CARD_LIMIT:],
                     agent="gpt-pro", discussion_trigger=False,
                 )
         else:
@@ -2537,7 +2541,9 @@ class PaperAgentBridge:
             self._delivered_sigs.add(sig)
             if len(self._delivered_sigs) > 200:
                 self._delivered_sigs = set(list(self._delivered_sigs)[-100:])
-        limit = self.settings.max_message_chars
+        # Cards hold ~30KB; keep the whole reply in the card and only overflow
+        # extremely long replies to a follow-up message.
+        limit = 12000
         head = text if len(text) <= limit else text[:limit].rstrip() + "\n\n…（下接）"
         try:
             if not self.cards.finalize(card, "done", head):

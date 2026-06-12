@@ -214,6 +214,8 @@ class PaperAgentBridge:
         self.cards = TurnCardManager(self.lark, self.settings)
         self._recent_handoff_sigs: set[str] = set()
         self._recent_handoff_sigs_lock = threading.Lock()
+        # GPT-Pro background summary cache: chat_id -> {"key": hash, "summary": str}
+        self._gpt_pro_summaries: dict[str, dict[str, str]] = {}
         self._delivered_sigs: set[str] = set()
         self._delivered_sigs_lock = threading.Lock()
         # Follow-up poller state: per (agent, chat_id), the transcript cursor
@@ -1157,6 +1159,25 @@ class PaperAgentBridge:
                 return f"{agent_name} `/model {model}` 已发送，等待确认。"
             return f"{agent_name} model 已记为 `{model}`，会话当前忙碌，下轮空闲时自动生效。"
 
+    def _gpt_pro_background_summary(self, chat_id: str, raw: str, config) -> str | None:
+        """Return a cached summary of the background, recomputing only when the
+        background grows materially. Keeps long-running groups cheap."""
+        import hashlib
+        from .gpt_pro_agent import summarize_background
+
+        key = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        cached = self._gpt_pro_summaries.get(chat_id)
+        if cached and cached.get("key") == key:
+            return cached.get("summary")
+        try:
+            summary = summarize_background(config, raw)
+        except Exception:
+            LOGGER.exception("GPT-Pro background summarization failed")
+            return None
+        if summary:
+            self._gpt_pro_summaries[chat_id] = {"key": key, "summary": summary}
+        return summary
+
     def _dispatch_gpt_pro(self, event: MessageEvent, route: Route) -> str:
         """Handle GPT-Pro agent: collect chat context, call internal API, return reply."""
         from .gpt_pro_agent import GptProConfig, call_gpt_pro
@@ -1197,11 +1218,9 @@ class PaperAgentBridge:
                 last_gpt_idx = i
                 break
 
-        truncated: list[dict[str, str]] = []
-        if last_gpt_idx >= 0:
-            # Background = everything up to and including GPT-Pro's last reply.
-            bg_lines = []
-            for entry in history[: last_gpt_idx + 1]:
+        def fold_background(entries: list[dict]) -> str:
+            lines = []
+            for entry in entries:
                 content = entry.get("content", "")
                 if not content:
                     continue
@@ -1211,18 +1230,35 @@ class PaperAgentBridge:
                     who = entry.get("agent", "assistant")
                 else:
                     who = "用户"
-                bg_lines.append(f"{who}: {content}")
-            background = "\n".join(bg_lines)
-            if len(background) > config.max_context_chars:
-                background = "（更早内容略）\n" + background[-config.max_context_chars:]
-            truncated.append({
-                "role": "user",
-                "content": (
-                    "以下是这个飞书群之前的对话背景（你是 GPT-Pro，群里还有 Codex、Claude 两个助手和用户）：\n\n"
-                    f"{background}\n\n"
-                    "下面是你上次回复之后的新对话，请基于全部上下文回答用户最新的问题。"
-                ),
-            })
+                lines.append(f"{who}: {content}")
+            return "\n".join(lines)
+
+        def background_block(entries: list[dict]) -> str | None:
+            raw = fold_background(entries)
+            if not raw:
+                return None
+            # Long background → summarize (cached per chat) to stay cheap and
+            # under the 272K-token surcharge threshold.
+            if len(raw) > config.summarize_threshold_chars:
+                summary = self._gpt_pro_background_summary(event.chat_id, raw, config)
+                if summary:
+                    return summary
+            if len(raw) > config.max_context_chars:
+                raw = "（更早内容略）\n" + raw[-config.max_context_chars:]
+            return raw
+
+        truncated: list[dict[str, str]] = []
+        if last_gpt_idx >= 0:
+            bg = background_block(history[: last_gpt_idx + 1])
+            if bg:
+                truncated.append({
+                    "role": "user",
+                    "content": (
+                        "以下是这个飞书群之前的对话背景（你是 GPT-Pro，群里还有 Codex、Claude 两个助手和用户）：\n\n"
+                        f"{bg}\n\n"
+                        "下面是你上次回复之后的新对话，请基于全部上下文回答用户最新的问题。"
+                    ),
+                })
             # GPT-Pro's own last reply as the assistant anchor.
             truncated.append({"role": "assistant", "content": history[last_gpt_idx].get("content", "")})
             # New messages since then.
@@ -1236,24 +1272,13 @@ class PaperAgentBridge:
                 else:
                     truncated.append({"role": "user", "content": content})
         else:
-            # First time GPT-Pro is asked here — give the full history as
-            # background (everyone is `user` so nothing is mistaken as its own).
-            bg_lines = []
-            for entry in history:
-                content = entry.get("content", "")
-                if not content:
-                    continue
-                who = entry.get("agent", "assistant") if entry.get("role") == "assistant" else "用户"
-                bg_lines.append(f"{who}: {content}")
-            if bg_lines:
-                background = "\n".join(bg_lines)
-                if len(background) > config.max_context_chars:
-                    background = "（更早内容略）\n" + background[-config.max_context_chars:]
+            bg = background_block(history)
+            if bg:
                 truncated.append({
                     "role": "user",
                     "content": (
                         "以下是这个飞书群的对话背景（你是 GPT-Pro，群里还有 Codex、Claude 两个助手和用户）：\n\n"
-                        f"{background}"
+                        f"{bg}"
                     ),
                 })
 

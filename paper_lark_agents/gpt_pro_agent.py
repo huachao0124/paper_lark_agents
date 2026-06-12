@@ -24,9 +24,12 @@ class GptProConfig:
     task_creator: str = "arimazhu"
     task_name: str = "debug"
     timeout: int = 600
-    # gpt-5.5-pro has a very large context window; this only bounds the folded
-    # background block so a runaway-long history can't blow up a single request.
-    max_context_chars: int = 400000
+    # Keep total input under ~272K tokens (~200K Chinese chars) to avoid the
+    # 2x input / 1.5x output surcharge gpt-5.5-pro applies above that threshold.
+    max_context_chars: int = 200000
+    # When the folded background exceeds this, summarize it instead of sending
+    # raw — keeps cost down on long-running groups.
+    summarize_threshold_chars: int = 40000
     instructions: str = (
         "你是 GPT-Pro，一个加入飞书研究群的助手，通过内部 API 平台运行 gpt-5.5-pro。"
         "群里还有 Codex 和 Claude 两个助手以及用户。只有用户 @ 你时你才会被调用。"
@@ -60,6 +63,29 @@ def _make_client(config: GptProConfig):
         base_url=base_url,
         timeout=httpx.Timeout(connect=60.0, read=config.timeout, write=60.0, pool=10.0),
     )
+
+
+def summarize_background(config: GptProConfig, background: str) -> str:
+    """Compress a long conversation background into a concise summary using a
+    cheaper low-effort call. Used so long-running groups don't re-send the full
+    raw history on every GPT-Pro turn."""
+    client = _make_client(config)
+    LOGGER.info("summarizing GPT-Pro background (%d chars)", len(background))
+    prompt = (
+        "把下面这个飞书群的历史对话压缩成一段简洁的背景摘要，保留关键结论、决定、"
+        "待办和重要事实，省略寒暄和重复。用中文，控制在 800 字以内：\n\n" + background
+    )
+    response = client.responses.create(
+        model=config.model,
+        input=[{"role": "user", "content": prompt}],
+        reasoning={"effort": "low"},
+    )
+    err = getattr(response, "error", None)
+    if err:
+        raise RuntimeError(f"GPT-Pro summarize error: {getattr(err, 'message', str(err))}")
+    summary = getattr(response, "output_text", None) or ""
+    LOGGER.info("background summarized: %d -> %d chars", len(background), len(summary))
+    return summary
 
 
 def call_gpt_pro(config: GptProConfig, messages: list[dict[str, str]]) -> tuple[str, str]:

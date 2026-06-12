@@ -600,6 +600,9 @@ class LarkSDK:
             .register_p2_im_chat_disbanded_v1(
                 lambda data: self._dispatch_lifecycle_event(data, "im.chat.disbanded_v1", on_event)
             )
+            .register_p2_im_message_recalled_v1(
+                lambda data: None  # ignored, but registered to avoid "processor not found" errors
+            )
             .build()
         )
 

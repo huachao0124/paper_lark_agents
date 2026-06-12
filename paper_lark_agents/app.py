@@ -1210,13 +1210,40 @@ class PaperAgentBridge:
                 "GPT-Pro", config.model, "", force=True,
             )
 
+        from .gpt_pro_agent import stream_gpt_pro
+
+        # Throttled streaming: push to the card at most every ~2s so the user
+        # sees reasoning + answer build up without hammering the Feishu API.
+        last_push = [0.0]
+        reasoning_seen = [False]
+
+        def on_update(kind: str, accumulated: str) -> None:
+            if not turn_card:
+                return
+            now = time.time()
+            if now - last_push[0] < 2.0:
+                return
+            last_push[0] = now
+            if kind == "reasoning":
+                reasoning_seen[0] = True
+                body = f"🤔 思考中…\n\n{accumulated[-1500:]}"
+            else:
+                body = accumulated[-2500:]
+            try:
+                self.cards.update(turn_card, body)
+            except Exception:
+                pass
+
         try:
-            reply, model_used = call_gpt_pro(config, truncated)
+            reply, model_used = stream_gpt_pro(config, truncated, on_update)
         except Exception as exc:
-            LOGGER.exception("GPT-Pro call failed")
-            if turn_card:
-                self.cards.finalize(turn_card, "failed", f"调用失败：{exc}")
-            return ""
+            LOGGER.exception("GPT-Pro stream failed; falling back to non-stream")
+            try:
+                reply, model_used = call_gpt_pro(config, truncated)
+            except Exception as exc2:
+                if turn_card:
+                    self.cards.finalize(turn_card, "failed", f"调用失败：{exc2}")
+                return ""
 
         if turn_card:
             if turn_card.model != model_used:

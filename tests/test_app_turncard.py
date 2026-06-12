@@ -124,12 +124,22 @@ class TurnCardTests(unittest.TestCase):
     def test_finalize_long_answer_overflows_to_markdown(self):
         with tempfile.TemporaryDirectory() as tmp:
             b = self.bridge(Path(tmp))
-            limit = b.settings.max_message_chars
-            long_answer = "甲" * (limit + 500)
+            # Cards hold up to 12000 chars; only longer replies overflow.
+            long_answer = "甲" * 12500
             card = TurnCard("card_1", "oc_a", "codex", "Codex", "gpt", "xhigh", 0.0)
             b.finalize_turn_reply(card, Route("agent", text="q", agent="codex"), event(), long_answer, source_agent=None, handoff_depth=0)
             self.assertTrue(b.lark.updates or b.lark.cards)  # head in card
             self.assertEqual(len(b.lark.markdowns), 1)       # tail overflowed to a message
+
+    def test_finalize_medium_answer_stays_in_card(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            b = self.bridge(Path(tmp))
+            # A reply that would overflow a plain message but fits in a card.
+            answer = "甲" * 5000
+            card = TurnCard("card_1", "oc_a", "codex", "Codex", "gpt", "xhigh", 0.0)
+            b.finalize_turn_reply(card, Route("agent", text="q", agent="codex"), event(), answer, source_agent=None, handoff_depth=0)
+            self.assertTrue(b.lark.updates or b.lark.cards)  # whole reply in card
+            self.assertEqual(len(b.lark.markdowns), 0)       # no overflow message
 
     def test_finalize_at_peer_queues_handoff(self):
         with tempfile.TemporaryDirectory() as tmp:

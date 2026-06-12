@@ -48,7 +48,8 @@ HELP_TEXT = """Available commands:
 
 /codex <question>
 /claude <question>
-/both <question> — send to both agents at once
+/both <question> — send to Codex + Claude at once
+/all <question> — send to Codex + Claude + GPT-Pro at once
 /debate <paper, claim, or question>
 /import <source_chat_id> — import room memory from another group
 /workspace [path|reset]
@@ -133,7 +134,16 @@ def route_message(
     # and /both — but still allow /debate, /task, and respond_to_all (each
     # process uses its own default_agent so there is no cross-instance conflict).
     if strict_alias and alias_remainder is None:
+        # /both → codex + claude only (gpt-pro excluded).
         for prefix in ("/both", "!both", "@both"):
+            remainder = _strip_prefix(text, lowered, prefix)
+            if remainder is not None and remainder:
+                targets = {a: remainder for a in enabled_order if a in {"codex", "claude"}}
+                if not targets:
+                    return Route("ignore")  # this process is gpt-pro — skip /both
+                return Route("multi_agent", text=remainder, agent_texts=targets)
+        # /all → every enabled agent including gpt-pro.
+        for prefix in ("/all", "!all", "@all"):
             remainder = _strip_prefix(text, lowered, prefix)
             if remainder is not None and remainder:
                 return Route(

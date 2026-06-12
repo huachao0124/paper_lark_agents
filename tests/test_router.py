@@ -400,6 +400,23 @@ class RouterTests(unittest.TestCase):
         route = route_message("/claude critique this", enabled_agents=("codex",))
         self.assertEqual(route.kind, "ignore")
 
+    def test_both_excludes_gpt_pro(self):
+        # /both reaches codex/claude but gpt-pro bridge must ignore it.
+        r_codex = route_message("/both 看法", enabled_agents=("codex",), bot_aliases=("codex-cvm",), default_agent="codex", strict_alias=True)
+        self.assertEqual(r_codex.kind, "multi_agent")
+        self.assertEqual(list(r_codex.agent_texts.keys()), ["codex"])
+        r_gpt = route_message("/both 看法", enabled_agents=("gpt-pro",), bot_aliases=("gpt-pro",), default_agent="gpt-pro", strict_alias=True)
+        self.assertEqual(r_gpt.kind, "ignore")
+
+    def test_all_includes_gpt_pro(self):
+        # /all reaches every bridge, gpt-pro included.
+        r_gpt = route_message("/all 看法", enabled_agents=("gpt-pro",), bot_aliases=("gpt-pro",), default_agent="gpt-pro", strict_alias=True)
+        self.assertEqual(r_gpt.kind, "multi_agent")
+        self.assertEqual(list(r_gpt.agent_texts.keys()), ["gpt-pro"])
+        r_codex = route_message("/all 看法", enabled_agents=("codex",), bot_aliases=("codex-cvm",), default_agent="codex", strict_alias=True)
+        self.assertEqual(r_codex.kind, "multi_agent")
+        self.assertEqual(list(r_codex.agent_texts.keys()), ["codex"])
+
     def test_shell_command_via_alias(self):
         route = route_message(
             "@Claude ! git push origin main",

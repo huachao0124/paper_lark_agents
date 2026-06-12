@@ -89,7 +89,7 @@ def summarize_background(config: GptProConfig, background: str) -> str:
     response = client.responses.create(
         model=config.model,
         input=[{"role": "user", "content": prompt}],
-        reasoning={"effort": "low"},
+        reasoning={"effort": "medium"},  # gpt-5.5-pro: medium/high/xhigh only
     )
     err = getattr(response, "error", None)
     if err:

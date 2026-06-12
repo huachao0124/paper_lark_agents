@@ -652,7 +652,6 @@ class PaperAgentBridge:
 
     def handle_event(self, event: MessageEvent) -> None:
         if not self._chat_allowed(event.chat_id):
-            LOGGER.info("event dropped: chat not allowed (%s)", event.chat_id)
             return
         if self.settings.bot_open_id and event.sender_id == self.settings.bot_open_id:
             return
@@ -692,7 +691,6 @@ class PaperAgentBridge:
                 # Either way, don't route this message normally.
                 return
 
-        LOGGER.info("routing event content=%r aliases=%s default=%s", event.content[:80], self.settings.bot_aliases, self.default_agent)
         try:
             route = route_message(
                 event.content,

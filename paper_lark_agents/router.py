@@ -92,6 +92,9 @@ def route_message(
         if alias_remainder is not None:
             command_text = alias_remainder
             command_lowered = command_text.lower()
+        elif strict_alias and re.match(r"@\S+\s", text):
+            # Message explicitly @-mentions some other bot — not ours.
+            return Route("ignore")
 
     for prefix in ("/clear", "!clear", "clear"):
         remainder = _strip_prefix(command_text, command_lowered, prefix)

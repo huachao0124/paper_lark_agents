@@ -738,6 +738,8 @@ class PaperAgentBridge:
             return ("codex",)
         if self.settings.agent_mode == "claude":
             return ("claude",)
+        if self.settings.agent_mode == "gpt-pro":
+            return ("gpt-pro",)
         if self.settings.agent_mode == "tasks":
             return ()
         return ("codex", "claude")
@@ -927,6 +929,8 @@ class PaperAgentBridge:
                     if self.settings.enable_memory:
                         self.memory.append_assistant(event.chat_id, agent, reply)
             return ""
+        if route.kind == "agent" and route.agent == "gpt-pro":
+            return self._dispatch_gpt_pro(event, route)
         if route.kind == "agent":
             assert route.agent is not None
             if not route.text:
@@ -1152,6 +1156,85 @@ class PaperAgentBridge:
             if sent:
                 return f"{agent_name} `/model {model}` 已发送，等待确认。"
             return f"{agent_name} model 已记为 `{model}`，会话当前忙碌，下轮空闲时自动生效。"
+
+    def _dispatch_gpt_pro(self, event: MessageEvent, route: Route) -> str:
+        """Handle GPT-Pro agent: collect chat context, call internal API, return reply."""
+        from .gpt_pro_agent import GptProConfig, call_gpt_pro
+
+        s = self.settings
+        if not s.gpt_pro_host or not s.gpt_pro_user or not s.gpt_pro_token:
+            return "GPT-Pro 未配置（缺少 PLA_GPT_PRO_HOST/USER/TOKEN）。"
+
+        config = GptProConfig(
+            host=s.gpt_pro_host,
+            user=s.gpt_pro_user,
+            token=s.gpt_pro_token,
+            model=s.gpt_pro_model,
+            task_creator=s.gpt_pro_task_creator,
+            task_name=s.gpt_pro_task_name,
+        )
+
+        # Build context: chat history from memory (includes all agents' messages)
+        messages: list[dict[str, str]] = []
+        if self.settings.enable_memory:
+            history = self.memory._read(event.chat_id)
+            for entry in history:
+                role = "assistant" if entry.get("role") == "assistant" else "user"
+                content = entry.get("content", "")
+                if content:
+                    agent = entry.get("agent", "")
+                    if role == "assistant" and agent:
+                        content = f"[{agent}] {content}"
+                    messages.append({"role": role, "content": content})
+
+        # Add the current user message
+        messages.append({"role": "user", "content": route.text or event.content})
+
+        # Truncate context to fit token limits (rough char-based estimate)
+        total = 0
+        truncated: list[dict[str, str]] = []
+        for msg in reversed(messages):
+            total += len(msg["content"])
+            if total > config.max_context_chars:
+                break
+            truncated.insert(0, msg)
+        if not truncated:
+            truncated = [messages[-1]]
+
+        # Show a Running card
+        turn_card = None
+        if self.settings.send_progress:
+            turn_card = self.cards.acquire(
+                event.chat_id, "gpt-pro",
+                "GPT-Pro", config.model, "", force=True,
+            )
+
+        try:
+            reply, model_used = call_gpt_pro(config, truncated)
+        except Exception as exc:
+            LOGGER.exception("GPT-Pro call failed")
+            if turn_card:
+                self.cards.finalize(turn_card, "failed", f"调用失败：{exc}")
+            return ""
+
+        if turn_card:
+            if turn_card.model != model_used:
+                turn_card.model = model_used
+            self.cards.finalize(turn_card, "done", reply[:self.settings.max_message_chars])
+            if len(reply) > self.settings.max_message_chars:
+                self.send_bridge_markdown(
+                    event.chat_id, reply[self.settings.max_message_chars:],
+                    agent="gpt-pro", discussion_trigger=False,
+                )
+        else:
+            self.send_bridge_markdown(
+                event.chat_id, reply, agent="gpt-pro", discussion_trigger=False,
+            )
+
+        if self.settings.enable_memory:
+            self.memory.append_assistant(event.chat_id, "gpt-pro", reply)
+
+        return ""
 
         return self.run_session_command_with_status(agent, chat_id, command, workspace)
 
@@ -1865,6 +1948,8 @@ class PaperAgentBridge:
             return "Codex"
         if agent == "claude":
             return "Claude"
+        if agent == "gpt-pro":
+            return "GPT-Pro"
         return agent
 
     def room_memory(self, chat_id: str) -> str:

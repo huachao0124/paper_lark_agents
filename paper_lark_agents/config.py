@@ -10,7 +10,7 @@ from .effort import EffortError, normalize_effort
 from .responders import ResponderError, normalize_responder
 
 
-AgentMode = Literal["codex", "claude", "both", "tasks"]
+AgentMode = Literal["codex", "claude", "both", "tasks", "gpt-pro"]
 
 
 def load_env_file(path: str | os.PathLike[str] | None) -> None:
@@ -212,6 +212,12 @@ class Settings:
     session_command_watch_seconds: int
     session_suffix: str | None
     strict_alias_routing: bool
+    gpt_pro_host: str | None
+    gpt_pro_user: str | None
+    gpt_pro_token: str | None
+    gpt_pro_model: str
+    gpt_pro_task_creator: str
+    gpt_pro_task_name: str
 
 
 def load_settings(env_file: str | None = ".env") -> Settings:
@@ -219,7 +225,7 @@ def load_settings(env_file: str | None = ".env") -> Settings:
     workspace = Path(_env("PLA_WORKSPACE", os.getcwd())).expanduser().resolve()
     event_key = _env("PLA_EVENT_KEY", "im.message.receive_v1")
     agent_mode = _env("PLA_AGENT_MODE", "both").strip().lower()
-    if agent_mode not in {"codex", "claude", "both", "tasks"}:
+    if agent_mode not in {"codex", "claude", "both", "tasks", "gpt-pro"}:
         agent_mode = "both"
     bot_aliases = _csv("PLA_BOT_ALIASES")
     if not bot_aliases and agent_mode == "codex":
@@ -321,6 +327,12 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         session_command_watch_seconds=_int("PLA_SESSION_COMMAND_WATCH_SECONDS", 20),
         session_suffix=_optional("PLA_SESSION_SUFFIX"),
         strict_alias_routing=_bool("PLA_STRICT_ALIAS_ROUTING", False),
+        gpt_pro_host=_optional("PLA_GPT_PRO_HOST"),
+        gpt_pro_user=_optional("PLA_GPT_PRO_USER"),
+        gpt_pro_token=_optional("PLA_GPT_PRO_TOKEN"),
+        gpt_pro_model=os.environ.get("PLA_GPT_PRO_MODEL", "gpt-5.5-pro"),
+        gpt_pro_task_creator=os.environ.get("PLA_GPT_PRO_TASK_CREATOR", "arimazhu"),
+        gpt_pro_task_name=os.environ.get("PLA_GPT_PRO_TASK_NAME", "debug"),
     )
 
 

@@ -19,7 +19,7 @@ RouteKind = Literal[
     "session_command",
     "shell_command",
 ]
-AgentName = Literal["codex", "claude"]
+AgentName = Literal["codex", "claude", "gpt-pro"]
 
 
 @dataclass(frozen=True)

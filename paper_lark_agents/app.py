@@ -1237,9 +1237,27 @@ class PaperAgentBridge:
         if self.settings.enable_memory:
             self.memory.append_assistant(event.chat_id, "gpt-pro", reply)
 
-        return ""
+        # Forward GPT-Pro's reply to both Codex and Claude so they stay in the
+        # loop. Each peer bridge picks up the handoff where it is target_agent.
+        if not self.is_no_reply(reply):
+            forwarded = f"GPT-Pro 回复了用户：\n\n{reply}"
+            for target in ("codex", "claude"):
+                try:
+                    self.handoffs.enqueue(
+                        event.chat_id,
+                        source_agent="gpt-pro",
+                        target_agent=target,
+                        content=forwarded,
+                        origin_event_id=event.event_id,
+                        origin_message_id=event.message_id,
+                        sender_id=event.sender_id,
+                        depth=0,
+                    )
+                    LOGGER.info("forwarded GPT-Pro reply to %s in %s", target, event.chat_id)
+                except Exception:
+                    LOGGER.exception("failed to forward GPT-Pro reply to %s", target)
 
-        return self.run_session_command_with_status(agent, chat_id, command, workspace)
+        return ""
 
     @staticmethod
     def _strip_feishu_markdown(text: str) -> str:

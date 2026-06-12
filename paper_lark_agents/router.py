@@ -80,7 +80,7 @@ def route_message(
     if not text:
         return Route("ignore")
 
-    enabled_order = tuple(agent for agent in enabled_agents if agent in {"codex", "claude"})
+    enabled_order = tuple(enabled_agents)
     enabled = set(enabled_agents)
     lowered = text.lower()
 

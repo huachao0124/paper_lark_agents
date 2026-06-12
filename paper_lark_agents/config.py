@@ -216,6 +216,7 @@ class Settings:
     gpt_pro_user: str | None
     gpt_pro_token: str | None
     gpt_pro_model: str
+    gpt_pro_effort: str
     gpt_pro_task_creator: str
     gpt_pro_task_name: str
 
@@ -331,6 +332,7 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         gpt_pro_user=_optional("PLA_GPT_PRO_USER"),
         gpt_pro_token=_optional("PLA_GPT_PRO_TOKEN"),
         gpt_pro_model=os.environ.get("PLA_GPT_PRO_MODEL", "gpt-5.5-pro"),
+        gpt_pro_effort=os.environ.get("PLA_GPT_PRO_EFFORT", "xhigh"),
         gpt_pro_task_creator=os.environ.get("PLA_GPT_PRO_TASK_CREATOR", "arimazhu"),
         gpt_pro_task_name=os.environ.get("PLA_GPT_PRO_TASK_NAME", "debug"),
     )

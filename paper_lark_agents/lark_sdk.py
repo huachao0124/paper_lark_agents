@@ -614,8 +614,12 @@ class LarkSDK:
         ws_client.start()
 
     def _dispatch_im_event(self, data: Any, event_type: str, on_event: Callable[[LarkEvent], None]) -> None:
-        raw = self._p2_message_to_raw(data, event_type)
-        on_event(LarkEvent.from_json(raw))
+        try:
+            LOGGER.info("received %s event", event_type)
+            raw = self._p2_message_to_raw(data, event_type)
+            on_event(LarkEvent.from_json(raw))
+        except Exception:
+            LOGGER.exception("failed to dispatch %s event", event_type)
 
     def _dispatch_lifecycle_event(self, data: Any, event_type: str, on_event: Callable[[LarkEvent], None]) -> None:
         chat_id = ""

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -48,7 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     route_cmd.add_argument("message")
 
     ask_cmd = add_common(sub.add_parser("ask", help="Ask a local agent once."))
-    ask_cmd.add_argument("--agent", choices=["codex", "claude", "both"], default="both")
+    ask_cmd.add_argument("--agent", choices=["codex", "claude", "codebuddy", "both"], default="both")
     ask_cmd.add_argument("prompt")
 
     send_cmd = add_common(sub.add_parser("send", help="Send markdown to a Feishu chat."))
@@ -74,6 +75,7 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    _protect_bridge_process_from_oom()
     settings = load_settings(args.env)
 
     try:
@@ -126,6 +128,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.agent in {"claude", "both"}:
                 print("## Claude Code")
                 print(runner.run_claude(args.prompt, "manual").text)
+            if args.agent == "codebuddy":
+                print("## CodeBuddy")
+                print(runner.run_codebuddy(args.prompt, "manual").text)
             return 0
         if args.command == "send":
             result = LarkCLI(settings).send_markdown(args.chat_id, args.markdown)
@@ -156,41 +161,67 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
+def _protect_bridge_process_from_oom() -> None:
+    raw = os.environ.get("PLA_OOM_SCORE_ADJ", "-800").strip()
+    if raw.lower() in {"", "off", "false", "none", "disable", "disabled"}:
+        return
+    try:
+        value = int(raw)
+    except ValueError:
+        logging.warning("invalid PLA_OOM_SCORE_ADJ=%r; skipping OOM protection", raw)
+        return
+    value = max(-1000, min(1000, value))
+    try:
+        Path("/proc/self/oom_score_adj").write_text(f"{value}\n", encoding="utf-8")
+    except OSError as exc:
+        logging.debug("failed to set oom_score_adj=%s: %s", value, exc)
+
+
 def route_agent_settings(agent_mode: str) -> tuple[tuple[str, ...], str | None]:
     if agent_mode == "codex":
         return ("codex",), "codex"
     if agent_mode == "claude":
         return ("claude",), "claude"
+    if agent_mode == "codebuddy":
+        return ("codebuddy",), "codebuddy"
     if agent_mode == "tasks":
         return (), None
     return ("codex", "claude"), None
 
 
 def serve_duo(codex_env: str, claude_env: str, verbose: bool = False) -> int:
+    specs = [
+        {"name": "codex", "cmd": _serve_cmd(codex_env, verbose), "restart": True},
+        {"name": "claude", "cmd": _serve_cmd(claude_env, verbose), "restart": True},
+        {"name": "dashboard", "cmd": _dashboard_cmd(codex_env, verbose), "restart": False},
+    ]
     children = [
-        subprocess.Popen(_serve_cmd(codex_env, verbose)),
-        subprocess.Popen(_serve_cmd(claude_env, verbose)),
-        subprocess.Popen(_dashboard_cmd(codex_env, verbose)),
+        {**spec, "process": subprocess.Popen(spec["cmd"])}
+        for spec in specs
     ]
     try:
         while children:
-            for child in list(children):
+            for child_info in list(children):
+                child = child_info["process"]
                 code = child.poll()
                 if code is None:
                     continue
-                children.remove(child)
-                if code != 0:
-                    for other in children:
-                        other.terminate()
-                    for other in children:
-                        other.wait(timeout=10)
-                    return code
+                name = str(child_info["name"])
+                cmd = list(child_info["cmd"])
+                if not child_info["restart"]:
+                    children.remove(child_info)
+                    if code != 0:
+                        logging.warning("%s process exited with code %s", name, code)
+                    continue
+                logging.warning("%s bridge exited with code %s; restarting", name, code)
+                time.sleep(2)
+                child_info["process"] = subprocess.Popen(cmd)
             time.sleep(1)
     except KeyboardInterrupt:
-        for child in children:
-            child.terminate()
-        for child in children:
-            child.wait(timeout=10)
+        for child_info in children:
+            child_info["process"].terminate()
+        for child_info in children:
+            child_info["process"].wait(timeout=10)
         return 130
     return 0
 

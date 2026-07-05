@@ -13,6 +13,11 @@ from urllib.parse import quote
 
 
 AGENTS = ("codex", "claude")
+AGENT_LABELS = {
+    "codex": "Codex",
+    "claude": "Claude",
+    "codebuddy": "CodeBuddy",
+}
 
 
 @dataclass(frozen=True)
@@ -303,9 +308,8 @@ class StatusDashboardDoc:
         self.tab_name = tab_name
 
     def to_xml(self) -> str:
-        codex = self.snapshot.statuses.get("codex")
-        claude = self.snapshot.statuses.get("claude")
-        workspace = workspace_for_ticker(codex, claude, self.snapshot.bridge) or "unknown"
+        agent_statuses = [self.snapshot.statuses.get(agent) for agent in AGENTS]
+        workspace = workspace_for_ticker(*agent_statuses, self.snapshot.bridge) or "unknown"
         return "\n".join(
             [
                 f"<title>{xml_text(self.tab_name)}</title>",
@@ -327,12 +331,11 @@ class StatusDashboardDoc:
 
 
 def ticker_summary(snapshot: DashboardSnapshot) -> str:
-    codex = snapshot.statuses.get("codex")
-    claude = snapshot.statuses.get("claude")
-    workspace = workspace_for_ticker(codex, claude, snapshot.bridge)
+    agent_statuses = [snapshot.statuses.get(agent) for agent in AGENTS]
+    workspace = workspace_for_ticker(*agent_statuses, snapshot.bridge)
     lines = [
-        f"**Codex:** {agent_ticker(codex)}",
-        f"**Claude:** {agent_ticker(claude)}",
+        f"**{AGENT_LABELS[agent]}:** {agent_ticker(snapshot.statuses.get(agent))}"
+        for agent in AGENTS
     ]
     if snapshot.bridge:
         lines.insert(0, f"**Bridge:** {bridge_ticker(snapshot.bridge)}")
@@ -345,8 +348,8 @@ def status_table_xml(snapshot: DashboardSnapshot) -> str:
     rows = []
     if snapshot.bridge:
         rows.append(status_row_xml("Bridge", snapshot.bridge))
-    rows.append(status_row_xml("Codex", snapshot.statuses.get("codex")))
-    rows.append(status_row_xml("Claude", snapshot.statuses.get("claude")))
+    for agent in AGENTS:
+        rows.append(status_row_xml(AGENT_LABELS[agent], snapshot.statuses.get(agent)))
     return "\n".join(
         [
             "<table>",
@@ -460,7 +463,7 @@ def applink_url(url: str) -> str:
 
 
 def agent_element(agent: str, status: dict[str, Any] | None) -> dict[str, object]:
-    display = "Codex" if agent == "codex" else "Claude"
+    display = AGENT_LABELS.get(agent, agent)
     return {
         "tag": "div",
         "text": {

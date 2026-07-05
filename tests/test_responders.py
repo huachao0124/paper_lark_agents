@@ -53,6 +53,19 @@ class ChatResponderStoreTests(unittest.TestCase):
             self.assertTrue(other.allows("oc_a", "codex"))
             self.assertFalse(other.allows("oc_a", "claude"))
 
+    def test_write_does_not_reuse_fixed_tmp_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = root / ".state"
+            state.mkdir()
+            legacy_tmp = state / "chat_responders.tmp"
+            legacy_tmp.write_text("sentinel", encoding="utf-8")
+
+            self.store(root).set("oc_a", "codebuddy")
+
+            self.assertEqual(legacy_tmp.read_text(encoding="utf-8"), "sentinel")
+            self.assertEqual(self.store(root).current("oc_a"), "codebuddy")
+
     def test_reset_falls_back_to_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = self.store(Path(tmp), default="codex")

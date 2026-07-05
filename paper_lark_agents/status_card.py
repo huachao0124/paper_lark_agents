@@ -63,7 +63,7 @@ def turn_reply_card(
     final reply when done. Header carries the agent + state; the body is the
     activity line (running) or the answer (done)."""
     elements: list[dict[str, object]] = [
-        {"tag": "div", "text": {"tag": "lark_md", "content": body or "…"}}
+        {"tag": "markdown", "content": body or "…"}
     ]
     footer_bits = []
     if model:
@@ -74,15 +74,15 @@ def turn_reply_card(
         footer_bits.append(f"{max(0, int(time.time() - started_at))}s")
     if footer_bits:
         elements.append(
-            {"tag": "div", "text": {"tag": "lark_md", "content": "_" + " · ".join(footer_bits) + "_"}}
+            {"tag": "markdown", "content": "_" + " · ".join(footer_bits) + "_"}
         )
     return {
-        "config": {"wide_screen_mode": True, "update_multi": True},
+        "schema": "2.0",
         "header": {
             "template": template_for_state(state),
             "title": {"tag": "plain_text", "content": f"{agent_name} · {label_for_state(state)}"},
         },
-        "elements": elements,
+        "body": {"elements": elements},
     }
 
 

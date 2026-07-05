@@ -16,10 +16,11 @@ RouteKind = Literal[
     "clear",
     "responder",
     "import_memory",
+    "memory_config",
     "session_command",
     "shell_command",
 ]
-AgentName = Literal["codex", "claude", "gpt-pro"]
+AgentName = Literal["codex", "claude", "gpt-pro", "codebuddy"]
 
 
 @dataclass(frozen=True)
@@ -42,21 +43,27 @@ class Route:
     # than explicit addressing (@mention, /codex, etc.). Only broadcast routes are
     # subject to the per-chat default-responder gate.
     broadcast: bool = False
+    # True when the message explicitly @-mentioned THIS bot's alias. Management
+    # commands addressed this way bypass the handle_management_commands gate,
+    # so a group with only the non-management bot can still run /workspace.
+    addressed: bool = False
 
 
 HELP_TEXT = """Available commands:
 
 /codex <question>
 /claude <question>
+/codebuddy <question>
 /both <question> — send to Codex + Claude at once
-/all <question> — send to Codex + Claude + GPT-Pro at once
+/all <question> — send to every enabled assistant at once
 /debate <paper, claim, or question>
 /import <source_chat_id> — import room memory from another group
 /workspace [path|reset]
-/responder [codex|claude|both|reset]
+/responder [codex|claude|codebuddy|both|reset]
 /clear [init]
 @Codex /<session command>
 @Claude /<session command>
+@CodeBuddy /<session command>
 /help
 
 Ordinary group messages are forwarded in full to the active assistant session(s).
@@ -93,14 +100,41 @@ def route_message(
         if alias_remainder is not None:
             command_text = alias_remainder
             command_lowered = command_text.lower()
-        elif strict_alias and re.match(r"@\S+\s", text):
-            # Message explicitly @-mentions some other bot — not ours.
+        elif (
+            strict_alias
+            and re.match(r"@\S+\s", text)
+            and default_agent not in addressed_agent_sequence(text)
+        ):
+            # Message explicitly @-mentions another bot and never mentions this
+            # process later in the same message.
             return Route("ignore")
 
     for prefix in ("/clear", "!clear", "clear"):
         remainder = _strip_prefix(command_text, command_lowered, prefix)
         if remainder is not None:
-            return Route("clear", text=remainder)
+            return Route("clear", text=remainder, addressed=alias_remainder is not None)
+
+    # Bridge-owned commands are parsed BEFORE the raw session-command check —
+    # the CLIs have no /workspace etc., so forwarding them would be useless.
+    for prefix in ("/workspace", "!workspace", "/cwd", "!cwd", "workspace:", "cwd:"):
+        remainder = _strip_prefix(command_text, command_lowered, prefix)
+        if remainder is not None:
+            return Route("workspace", text=remainder, addressed=alias_remainder is not None)
+
+    for prefix in ("/responder", "!responder", "responder:"):
+        remainder = _strip_prefix(command_text, command_lowered, prefix)
+        if remainder is not None:
+            return Route("responder", text=remainder, addressed=alias_remainder is not None)
+
+    for prefix in ("/import", "!import"):
+        remainder = _strip_prefix(command_text, command_lowered, prefix)
+        if remainder is not None:
+            return Route("import_memory", text=remainder)
+
+    for prefix in ("/memory",):
+        remainder = _strip_prefix(command_text, command_lowered, prefix)
+        if remainder is not None:
+            return Route("memory_config", text=remainder)
 
     if alias_remainder is not None and default_agent in enabled and is_raw_session_command(alias_remainder):
         return Route("session_command", text=alias_remainder, agent=default_agent)
@@ -114,35 +148,20 @@ def route_message(
     if command_lowered in {"/help", "!help", "help"}:
         return Route("help", text=HELP_TEXT)
 
-    for prefix in ("/workspace", "!workspace", "/cwd", "!cwd", "workspace:", "cwd:"):
-        remainder = _strip_prefix(command_text, command_lowered, prefix)
-        if remainder is not None:
-            return Route("workspace", text=remainder)
-
-    for prefix in ("/responder", "!responder", "responder:"):
-        remainder = _strip_prefix(command_text, command_lowered, prefix)
-        if remainder is not None:
-            return Route("responder", text=remainder)
-
-    for prefix in ("/import", "!import"):
-        remainder = _strip_prefix(command_text, command_lowered, prefix)
-        if remainder is not None:
-            return Route("import_memory", text=remainder)
-
     # In strict alias mode, the bot's own alias is the ONLY trigger for
     # explicit agent routing. Skip agent commands, multi-agent directives,
     # and /both — but still allow /debate, /task, and respond_to_all (each
     # process uses its own default_agent so there is no cross-instance conflict).
     if strict_alias and alias_remainder is None:
-        # /both → codex + claude only (gpt-pro excluded).
+        # /both → codex + claude only (newer agents excluded).
         for prefix in ("/both", "!both", "@both"):
             remainder = _strip_prefix(text, lowered, prefix)
             if remainder is not None and remainder:
                 targets = {a: remainder for a in enabled_order if a in {"codex", "claude"}}
                 if not targets:
-                    return Route("ignore")  # this process is gpt-pro — skip /both
+                    return Route("ignore")  # this process is another agent — skip /both
                 return Route("multi_agent", text=remainder, agent_texts=targets)
-        # /all → every enabled agent including gpt-pro.
+        # /all → every enabled agent including gpt-pro/codebuddy.
         for prefix in ("/all", "!all", "@all"):
             remainder = _strip_prefix(text, lowered, prefix)
             if remainder is not None and remainder:
@@ -166,6 +185,9 @@ def route_message(
             if remainder is not None:
                 task = parse_task_request(remainder)
                 return Route("task", text=remainder, task=task)
+        mention_route = _route_addressed_mentions(text, enabled_order)
+        if mention_route is not None:
+            return mention_route
         if respond_to_all:
             # Don't broadcast messages explicitly addressed to a known agent
             # name — let the target bot's process handle them (which returns
@@ -181,6 +203,17 @@ def route_message(
     # the default agent without checking hardcoded @codex/@claude patterns (which
     # might steal messages addressed to another instance of the same agent type).
     if strict_alias and alias_remainder is not None and default_agent in enabled:
+        mention_route = _route_addressed_mentions(
+            text,
+            enabled_order,
+            require_multiple_mentions=True,
+        )
+        # Only hand off to the mention route when it targets an agent enabled
+        # here. If it resolved to "ignore" (the other @-mentioned agents are not
+        # served by this process), the message was still addressed to THIS bot
+        # via its alias — fall through and serve it rather than dropping it.
+        if mention_route is not None and mention_route.kind != "ignore":
+            return mention_route
         if alias_remainder:
             if is_shell_command(alias_remainder):
                 return Route("shell_command", text=alias_remainder, agent=default_agent)
@@ -202,6 +235,14 @@ def route_message(
                 return Route("session_command", text=agent_text, agent=agent)
             return Route("multi_agent", text=text, agent_texts=enabled_texts)
 
+    mention_route = _route_addressed_mentions(
+        text,
+        enabled_order,
+        require_multiple_mentions=True,
+    )
+    if mention_route is not None:
+        return mention_route
+
     agent_command_candidates = [(text, lowered)]
     acknowledged = _strip_leading_acknowledgement(text)
     if acknowledged != text:
@@ -215,10 +256,13 @@ def route_message(
     for prefix in ("/both", "!both", "@both"):
         remainder = _strip_prefix(text, lowered, prefix)
         if remainder is not None and remainder:
+            targets = {agent: remainder for agent in enabled_order if agent in {"codex", "claude"}}
+            if not targets:
+                return Route("ignore")
             return Route(
                 "multi_agent",
                 text=remainder,
-                agent_texts={agent: remainder for agent in enabled_order},
+                agent_texts=targets,
             )
 
     for prefix in ("/debate", "!debate", "debate:"):
@@ -237,6 +281,10 @@ def route_message(
         if remainder is not None:
             task = parse_task_request(remainder)
             return Route("task", text=remainder, task=task)
+
+    mention_route = _route_addressed_mentions(text, enabled_order)
+    if mention_route is not None:
+        return mention_route
 
     if respond_to_all:
         if default_agent in enabled:
@@ -260,6 +308,8 @@ def _route_explicit_agent_command(
     for prefix, agent in (
         ("@claude code", "claude"),
         ("claude code", "claude"),
+        ("@code buddy", "codebuddy"),
+        ("code buddy", "codebuddy"),
         ("/codex", "codex"),
         ("!codex", "codex"),
         ("@codex", "codex"),
@@ -270,6 +320,11 @@ def _route_explicit_agent_command(
         ("@claude", "claude"),
         ("claude:", "claude"),
         ("claude", "claude"),
+        ("/codebuddy", "codebuddy"),
+        ("!codebuddy", "codebuddy"),
+        ("@codebuddy", "codebuddy"),
+        ("codebuddy:", "codebuddy"),
+        ("codebuddy", "codebuddy"),
     ):
         remainder = _strip_prefix(text, lowered, prefix)
         if remainder is None:
@@ -288,6 +343,34 @@ def _route_explicit_agent_command(
             continue
         return Route("agent", text=remainder, agent=agent)  # type: ignore[arg-type]
     return None
+
+
+def _route_addressed_mentions(
+    text: str,
+    enabled_order: tuple[AgentName, ...],
+    *,
+    require_multiple_mentions: bool = False,
+) -> Route | None:
+    mentioned = addressed_agent_sequence(text)
+    if not mentioned:
+        return None
+    if require_multiple_mentions and len(mentioned) < 2:
+        return None
+    enabled = set(enabled_order)
+    targets: list[AgentName] = []
+    for agent in mentioned:
+        if agent not in enabled or agent in targets:
+            continue
+        targets.append(agent)
+    if not targets:
+        return Route("ignore")
+    if len(targets) == 1:
+        return Route("agent", text=text, agent=targets[0])
+    return Route(
+        "multi_agent",
+        text=text,
+        agent_texts={agent: text for agent in targets},
+    )
 
 
 def split_multi_agent_directives(content: str) -> dict[AgentName, str] | None:
@@ -322,7 +405,7 @@ def _iter_agent_mentions(text: str):
     # An explicit "@name" may carry a bot display-name suffix ("@Codex-Mac");
     # bare names keep their old, suffix-free matching to avoid false positives.
     pattern = re.compile(
-        r"@(?:claude\s+code|claude|codex)(?:-[A-Za-z0-9]+)?|claude\s+code|claude|codex",
+        r"@(?:claude\s+code|claude|code\s+buddy|codebuddy|codex)(?:-[A-Za-z0-9]+)?|claude\s+code|code\s+buddy|claude|codebuddy|codex",
         re.IGNORECASE,
     )
     for match in pattern.finditer(text):
@@ -332,11 +415,22 @@ def _iter_agent_mentions(text: str):
         if end < len(text) and not _is_prefix_boundary(text[end]):
             continue
         raw = match.group(0).lower()
-        agent: AgentName = "codex" if "codex" in raw else "claude"
+        if "codebuddy" in raw or "code buddy" in raw:
+            agent: AgentName = "codebuddy"
+        elif "codex" in raw:
+            agent = "codex"
+        else:
+            agent = "claude"
         yield start, end, agent
 
 
-_ADDRESSED_AGENT_RE = re.compile(r"@\s*(claude\s+code|claude|codex)", re.IGNORECASE)
+_ADDRESSED_AGENT_RE = re.compile(
+    # Trailing (?![A-Za-z]) is a word boundary that excludes only letters, so
+    # "@codexified"/"@claudebot" do NOT match (ordinary text must not flip the
+    # responder) while "@codex-cvm" / "@codex," still address codex.
+    r"@\s*(claude\s+code|claude|code\s+buddy|codebuddy|codex)(?![A-Za-z])",
+    re.IGNORECASE,
+)
 
 
 def addressed_agents(text: str) -> set[AgentName]:
@@ -350,8 +444,27 @@ def addressed_agents(text: str) -> set[AgentName]:
     found: set[AgentName] = set()
     for match in _ADDRESSED_AGENT_RE.finditer(text or ""):
         raw = match.group(1).lower()
-        found.add("codex" if "codex" in raw else "claude")
+        if "codebuddy" in raw or "code buddy" in raw:
+            found.add("codebuddy")
+        elif "codex" in raw:
+            found.add("codex")
+        else:
+            found.add("claude")
     return found
+
+
+def addressed_agent_sequence(text: str) -> tuple[AgentName, ...]:
+    """Agents explicitly @-addressed, preserving mention order."""
+    found: list[AgentName] = []
+    for match in _ADDRESSED_AGENT_RE.finditer(text or ""):
+        raw = match.group(1).lower()
+        if "codebuddy" in raw or "code buddy" in raw:
+            found.append("codebuddy")
+        elif "codex" in raw:
+            found.append("codex")
+        else:
+            found.append("claude")
+    return tuple(found)
 
 
 def _clean_agent_directive_segment(text: str) -> str:
@@ -378,11 +491,15 @@ def _prepend_shared_context(
 
 
 def _agent_display_name(agent: AgentName) -> str:
-    return "Codex" if agent == "codex" else "Claude"
+    if agent == "codex":
+        return "Codex"
+    if agent == "codebuddy":
+        return "CodeBuddy"
+    return "Claude"
 
 
 def _is_bare_agent_prefix(prefix: str) -> bool:
-    return prefix in {"codex", "claude", "claude code"}
+    return prefix in {"codex", "claude", "claude code", "codebuddy", "code buddy"}
 
 
 def _starts_with_agent_connector(text: str) -> bool:
@@ -394,7 +511,15 @@ def _is_left_mention_boundary(char: str) -> bool:
 
 
 def is_raw_session_command(text: str) -> bool:
-    return text.lstrip().startswith("/")
+    stripped = text.lstrip()
+    if not stripped.startswith("/"):
+        return False
+    # Exclude URL-like paths (e.g. "/v1/chat/completions", "/api/foo") —
+    # these are ordinary text, not CLI slash commands like /model or /effort.
+    word = stripped.split()[0] if stripped.split() else stripped
+    if "/" in word[1:]:
+        return False
+    return True
 
 
 def is_shell_command(text: str) -> bool:

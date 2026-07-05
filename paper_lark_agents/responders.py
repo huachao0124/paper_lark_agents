@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import tempfile
 
 
-RESPONDER_CHOICES = ("codex", "claude", "both")
+RESPONDER_CHOICES = ("codex", "claude", "codebuddy", "both")
 
 
 class ResponderError(ValueError):
@@ -15,12 +16,14 @@ def normalize_responder(raw: str) -> str:
     value = raw.strip().lower()
     if value in {"claude code", "claudecode", "claude-code"}:
         return "claude"
+    if value in {"code buddy", "code-buddy", "code_buddy"}:
+        return "codebuddy"
     if value in {"all", "everyone"}:
         return "both"
     if value in RESPONDER_CHOICES:
         return value
     raise ResponderError(
-        "默认 responder 只能是 codex、claude 或 both，例如 `/responder claude`。"
+        "默认 responder 只能是 codex、claude、codebuddy 或 both，例如 `/responder claude`。"
     )
 
 
@@ -80,7 +83,22 @@ class ChatResponderStore:
         return result
 
     def _write(self, data: dict[str, str]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp_path.replace(self.path)
+        parent = self.path.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        tmp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=parent,
+                prefix=f"{self.path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                tmp_path = Path(handle.name)
+                handle.write(json.dumps(data, ensure_ascii=False, indent=2))
+            tmp_path.replace(self.path)
+        except Exception:
+            if tmp_path is not None:
+                tmp_path.unlink(missing_ok=True)
+            raise

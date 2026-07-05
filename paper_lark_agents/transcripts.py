@@ -4,7 +4,7 @@ This replaces the terminal marker-scraping path. The prompt is still pasted into
 the tmux session (subscription quota), but the reply is read from the structured
 transcript the CLI writes to disk, so no PLA_REPLY_START/END markers are needed.
 
-Two formats, confirmed against live files:
+Three formats, confirmed against live files:
 
 Claude (~/.claude/projects/<encoded-cwd>/<session-id>.jsonl):
     one JSON object per line; assistant turns are
@@ -20,6 +20,13 @@ Codex (~/.codex/sessions/Y/M/D/rollout-<ts>-<uuid>.jsonl):
     with an event {"type":"event_msg","payload":{"type":"task_complete",
     "last_agent_message": <final text>, ...}}. We match the rollout file by
     session_meta.cwd + recency.
+
+CodeBuddy (~/.codebuddy/projects/<encoded-cwd>/<session-id>.jsonl):
+    one JSON object per line; assistant turns are
+    {"type":"message","role":"assistant","status":"completed",
+     "content":[{"type":"output_text","text":...}],"message":{"usage":...}}.
+    Launch with `codebuddy --session-id <uuid>` so the file path is
+    deterministic.
 """
 
 from __future__ import annotations
@@ -54,10 +61,43 @@ def _claude_message_text(message: dict) -> str:
     return "\n".join(parts).strip()
 
 
+def _content_text(blocks: object, block_type: str) -> str:
+    if not isinstance(blocks, list):
+        return ""
+    parts = [
+        b["text"]
+        for b in blocks
+        if isinstance(b, dict) and b.get("type") == block_type and isinstance(b.get("text"), str)
+    ]
+    return "\n".join(parts).strip()
+
+
 # Tool names Claude uses to launch a background subagent/teammate. "Task" is
 # the standard Claude Code tool; "Agent" is the experimental agent-teams mode
 # (CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS / --teammate-mode).
 _SUBAGENT_TOOL_NAMES = {"Task", "Agent"}
+
+
+_LOOP_TERMINAL_TOOL_NAMES = {"ScheduleWakeup", "CronCreate"}
+
+
+def _schedules_wakeup(messages: list[dict]) -> bool:
+    """True if the last message schedules a loop wakeup / cron job.
+
+    ScheduleWakeup means "this iteration is done, wake me up later" — it's
+    the loop equivalent of end_turn. Without this, wait_for_jsonl_reply
+    blocks forever because stop_reason stays "tool_use"."""
+    if not messages:
+        return False
+    last = messages[-1]
+    for block in last.get("content") or []:
+        if (
+            isinstance(block, dict)
+            and block.get("type") == "tool_use"
+            and block.get("name") in _LOOP_TERMINAL_TOOL_NAMES
+        ):
+            return True
+    return False
 
 
 def _dispatches_task_subagent(messages: list[dict]) -> bool:
@@ -91,7 +131,8 @@ def claude_reply_from_lines(lines: list[dict]) -> TurnResult | None:
         return None
     last = messages[-1]
     dispatched = _dispatches_task_subagent(messages)
-    if last.get("stop_reason") not in CLAUDE_TERMINAL_STOP_REASONS and not dispatched:
+    scheduled = _schedules_wakeup(messages)
+    if last.get("stop_reason") not in CLAUDE_TERMINAL_STOP_REASONS and not dispatched and not scheduled:
         return None  # still generating / awaiting a (non-subagent) tool result
     if dispatched:
         # Subagent launched: the narration before it is a complete stage. Deliver
@@ -107,6 +148,38 @@ def claude_reply_from_lines(lines: list[dict]) -> TurnResult | None:
     if not text:
         return None
     usage = last.get("usage") if isinstance(last.get("usage"), dict) else None
+    return TurnResult(text=text, usage=usage)
+
+
+def codebuddy_reply_from_lines(lines: list[dict]) -> TurnResult | None:
+    """Return the finished reply from new CodeBuddy jsonl lines, or None if the
+    turn has not completed yet."""
+    messages = [
+        (index, o)
+        for index, o in enumerate(lines)
+        if o.get("type") == "message" and o.get("role") == "assistant"
+    ]
+    if not messages:
+        return None
+    last_index, last = messages[-1]
+    if any(
+        o.get("type") in {"function_call", "function_call_result", "reasoning"}
+        for o in lines[last_index + 1 :]
+    ):
+        return None
+    status = last.get("status")
+    if isinstance(status, str) and status and status != "completed":
+        return None
+    text = _content_text(last.get("content"), "output_text")
+    if not text:
+        text = "\n".join(
+            part for _, message in messages
+            if (part := _content_text(message.get("content"), "output_text"))
+        ).strip()
+    if not text:
+        return None
+    message = last.get("message")
+    usage = message.get("usage") if isinstance(message, dict) and isinstance(message.get("usage"), dict) else None
     return TurnResult(text=text, usage=usage)
 
 
@@ -217,6 +290,10 @@ def _codex_call_action(payload: dict) -> str:
                 arg = str(raw[key])
                 break
     label = "⚙️ exec" if name in ("exec_command", "shell", "bash") else (f"🔧 {name}" if name else "🔧 tool")
+    if arg:
+        import re
+        arg = re.sub(r"(?:SSHPASS|PASSWORD|TOKEN|SECRET|KEY)=['\"]?[^'\";\s]+['\"]?", "***", arg, flags=re.IGNORECASE)
+        arg = re.sub(r"sshpass\s+-\w\s+\S+", "sshpass ***", arg, flags=re.IGNORECASE)
     return f"{label} {_short(arg)}".strip() if arg else label
 
 
@@ -259,10 +336,102 @@ def codex_activity(lines: list[dict]) -> dict:
     return {"action": action or "✻ 思考中", "steps": steps, "tokens": tokens, "message": last_message}
 
 
+def codebuddy_activity(lines: list[dict]) -> dict:
+    steps = 0
+    action = ""
+    tokens = 0
+    for o in lines:
+        kind = o.get("type")
+        if kind == "function_call":
+            steps += 1
+            name = str(o.get("name") or "tool")
+            action = f"🔧 {name}"
+            raw = o.get("arguments")
+            if isinstance(raw, str) and raw.lstrip().startswith("{"):
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    data = {}
+                target = next(
+                    (data[key] for key in ("description", "command", "file_path", "path", "query") if data.get(key)),
+                    "",
+                )
+                if target:
+                    action = f"{action} {_short(target)}"
+            message = o.get("message")
+            usage = message.get("usage") if isinstance(message, dict) else None
+            if isinstance(usage, dict):
+                tokens += int(usage.get("output_tokens") or 0)
+        elif kind == "function_call_result":
+            name = str(o.get("name") or "tool")
+            action = f"✓ {name}"
+        elif kind == "reasoning":
+            action = "✻ 思考中"
+        elif kind == "message" and o.get("role") == "assistant":
+            action = "✍️ 整理回复"
+            message = o.get("message")
+            usage = message.get("usage") if isinstance(message, dict) else None
+            if isinstance(usage, dict):
+                tokens += int(usage.get("output_tokens") or 0)
+    return {"action": action or "✻ 思考中", "steps": steps, "tokens": tokens, "message": ""}
+
+
+def activity_status(lines: list[dict], agent: str) -> str:
+    """Just the volatile status line: current action + step count + tokens."""
+    if agent == "codex":
+        act = codex_activity(lines)
+    elif agent == "codebuddy":
+        act = codebuddy_activity(lines)
+    else:
+        act = claude_activity(lines)
+    status_parts = [act["action"]]
+    if act["steps"]:
+        status_parts.append(f"{act['steps']} 步")
+    tok = fmt_tokens(act["tokens"])
+    if tok:
+        status_parts.append(f"{tok} tok")
+    return " · ".join(status_parts)
+
+
+def turn_messages(lines: list[dict], agent: str) -> list[str]:
+    """All intermediate narration messages the agent has emitted this turn,
+    in order. These are pushed to the card as sticky content as they appear."""
+    messages: list[str] = []
+    if agent == "codex":
+        for o in lines:
+            if o.get("type") != "event_msg":
+                continue
+            payload = o.get("payload")
+            if not isinstance(payload, dict) or payload.get("type") != "agent_message":
+                continue
+            msg = (payload.get("message") or "").strip()
+            if msg and not _is_auto_review_output(msg):
+                messages.append(msg)
+    elif agent == "codebuddy":
+        for o in lines:
+            if o.get("type") == "message" and o.get("role") == "assistant":
+                text = _content_text(o.get("content"), "output_text")
+                if text:
+                    messages.append(text)
+    else:
+        for o in lines:
+            if o.get("type") != "assistant" or not isinstance(o.get("message"), dict):
+                continue
+            text = _claude_message_text(o["message"])
+            if text:
+                messages.append(text)
+    return messages
+
+
 def activity_detail(lines: list[dict], agent: str) -> str:
     """Live-activity summary for the status card: agent message (persistent) +
     current action + step count + tokens."""
-    act = codex_activity(lines) if agent == "codex" else claude_activity(lines)
+    if agent == "codex":
+        act = codex_activity(lines)
+    elif agent == "codebuddy":
+        act = codebuddy_activity(lines)
+    else:
+        act = claude_activity(lines)
     status_parts = [act["action"]]
     if act["steps"]:
         status_parts.append(f"{act['steps']} 步")
@@ -274,6 +443,23 @@ def activity_detail(lines: list[dict], agent: str) -> str:
     if message:
         return f"{message}\n\n{status_line}"
     return status_line
+
+
+def _is_auto_review_output(text: str) -> bool:
+    """Detect codex auto-review JSON output (not a real reply)."""
+    stripped = text.strip()
+    if not stripped.startswith("{"):
+        return False
+    try:
+        import json
+        obj = json.loads(stripped)
+        if not isinstance(obj, dict):
+            return False
+        keys = set(obj)
+        auto_review_keys = {"risk_level", "outcome", "user_authorization", "rationale"}
+        return bool(keys & auto_review_keys) and keys <= auto_review_keys
+    except (json.JSONDecodeError, ValueError):
+        return False
 
 
 def codex_reply_from_lines(lines: list[dict]) -> TurnResult | None:
@@ -290,7 +476,7 @@ def codex_reply_from_lines(lines: list[dict]) -> TurnResult | None:
         kind = payload.get("type")
         if kind == "task_complete":
             value = payload.get("last_agent_message")
-            if isinstance(value, str):
+            if isinstance(value, str) and not _is_auto_review_output(value):
                 text = value
         elif kind == "token_count":
             info = payload.get("info")
@@ -308,6 +494,19 @@ def claude_model_from_lines(lines: list[dict]) -> str | None:
         model = (o.get("message") or {}).get("model")
         if model and isinstance(model, str):
             return model
+    return None
+
+
+def codebuddy_model_from_lines(lines: list[dict]) -> str | None:
+    """Extract CodeBuddy's requested model from structured provider metadata."""
+    for o in reversed(lines):
+        provider = o.get("providerData")
+        if not isinstance(provider, dict):
+            continue
+        for key in ("model", "requestModelId", "requestModelName"):
+            model = provider.get(key)
+            if isinstance(model, str) and model.strip():
+                return model.strip()
     return None
 
 
@@ -341,6 +540,11 @@ def claude_effort_from_lines(lines: list[dict]) -> str | None:
     return None
 
 
+def codebuddy_effort_from_lines(lines: list[dict]) -> str | None:
+    """CodeBuddy's observed JSONL transcript does not record effort."""
+    return None
+
+
 def encode_claude_project_dir(workspace: Path) -> str:
     """Claude encodes the cwd into the project dir name by replacing every run
     of non-alphanumeric chars with a single dash (leading dash kept)."""
@@ -348,9 +552,27 @@ def encode_claude_project_dir(workspace: Path) -> str:
     return "".join(c if c.isalnum() else "-" for c in raw)
 
 
+def encode_codebuddy_project_dir(workspace: Path) -> str:
+    """CodeBuddy encodes the cwd by dropping the leading slash and replacing
+    path separators/special chars with dashes while preserving common filename
+    chars such as underscores."""
+    raw = str(workspace.expanduser().resolve()).lstrip(os.sep)
+    return "".join(c if c.isalnum() or c in "._-" else "-" for c in raw)
+
+
 def find_claude_session_file(projects_root: Path, session_id: str) -> Path | None:
     """Locate <session_id>.jsonl under the projects root. session_id is the
     uuid we launched the session with, so the match is exact."""
+    if not session_id:
+        return None
+    matches = glob.glob(str(projects_root / "*" / f"{session_id}.jsonl"))
+    if not matches:
+        return None
+    return Path(max(matches, key=os.path.getmtime))
+
+
+def find_codebuddy_session_file(projects_root: Path, session_id: str) -> Path | None:
+    """Locate <session_id>.jsonl under the CodeBuddy projects root."""
     if not session_id:
         return None
     matches = glob.glob(str(projects_root / "*" / f"{session_id}.jsonl"))
@@ -367,6 +589,15 @@ def find_claude_recent_session_file(projects_root: Path, workspace: Path) -> Pat
     the resolved path in session metadata so this heuristic runs at most once.
     """
     proj = projects_root / encode_claude_project_dir(workspace)
+    files = glob.glob(str(proj / "*.jsonl"))
+    if not files:
+        return None
+    return Path(max(files, key=os.path.getmtime))
+
+
+def find_codebuddy_recent_session_file(projects_root: Path, workspace: Path) -> Path | None:
+    """Fallback for an existing CodeBuddy session with no known session id."""
+    proj = projects_root / encode_codebuddy_project_dir(workspace)
     files = glob.glob(str(proj / "*.jsonl"))
     if not files:
         return None

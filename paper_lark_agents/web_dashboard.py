@@ -129,6 +129,7 @@ def dashboard_html(chat_id: str) -> str:
           <section class="agents">
             <article id="codex" class="agent"></article>
             <article id="claude" class="agent"></article>
+            <article id="codebuddy" class="agent"></article>
           </section>
         </main>
         <script>
@@ -169,7 +170,8 @@ def dashboard_html(chat_id: str) -> str:
         }}
 
         function renderAgent(id, data) {{
-          const name = id === 'codex' ? 'Codex' : 'Claude';
+          const names = {{ codex: 'Codex', claude: 'Claude', codebuddy: 'CodeBuddy' }};
+          const name = names[id] || id;
           const target = document.getElementById(id);
           const state = data?.state || 'idle';
           target.className = 'agent ' + state;
@@ -210,6 +212,7 @@ def dashboard_html(chat_id: str) -> str:
             renderBridge(data.bridge);
             renderAgent('codex', data.statuses?.codex);
             renderAgent('claude', data.statuses?.claude);
+            renderAgent('codebuddy', data.statuses?.codebuddy);
             document.getElementById('stamp').textContent = 'Updated ' + new Date().toLocaleTimeString();
           }} catch (error) {{
             document.getElementById('stamp').textContent = 'Disconnected';

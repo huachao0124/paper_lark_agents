@@ -115,6 +115,15 @@ class PendingRunStore:
                 return True
         return False
 
+    def has_chat_run(self, chat_id: str, agent: str) -> bool:
+        """Whether any run is still in flight for this (agent, chat).
+
+        Used to detect a mid-turn message: the new message should be steered
+        into the running turn instead of spawning a second poller."""
+        if not chat_id or not agent:
+            return False
+        return any(run.chat_id == chat_id for run in self.pending_for(agent))
+
     def claim(self, run_id: str) -> bool:
         if not run_id:
             return False

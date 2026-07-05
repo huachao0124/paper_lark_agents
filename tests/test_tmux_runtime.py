@@ -6,12 +6,19 @@ from shlex import quote as shlex_quote
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from paper_lark_agents.transcripts import (
+    codebuddy_model_from_lines,
+    codebuddy_reply_from_lines,
+    encode_codebuddy_project_dir,
+)
 from paper_lark_agents.tmux_runtime import (
     TmuxSessionRuntime,
     claude_feedback_prompt_visible,
+    codebuddy_prompt_has_pending_input,
     extract_mismatched_marked_reply_after_prompt,
     extract_marked_reply,
     has_codex_effort_arg,
+    has_codebuddy_effort_arg,
     has_model_arg,
     normalize_terminal_text,
     parse_session_effort,
@@ -22,13 +29,19 @@ from paper_lark_agents.tmux_runtime import (
     summarize_session_progress,
     without_existing_cwd_args,
     with_codex_effort_arg,
+    with_codebuddy_effort_arg,
     with_model_arg,
 )
 
 
 class ResumeLaunchTests(unittest.TestCase):
     def rt(self, agent):
-        settings = SimpleNamespace(state_dir=Path("/tmp"), codex_cmd="codex", claude_cmd="claude")
+        settings = SimpleNamespace(
+            state_dir=Path("/tmp"),
+            codex_cmd="codex",
+            claude_cmd="claude",
+            codebuddy_cmd="codebuddy",
+        )
         return TmuxSessionRuntime(settings, agent)
 
     def test_claude_fresh_uses_session_id(self):
@@ -57,10 +70,30 @@ class ResumeLaunchTests(unittest.TestCase):
         self.assertNotIn("-C", launch)
         self.assertIn("--no-alt-screen", launch)
 
+    def test_codebuddy_fresh_uses_session_id(self):
+        launch, uid = self.rt("codebuddy").build_launch_command(
+            ["codebuddy", "--permission-mode", "acceptEdits"], None,
+        )
+        self.assertIn("--session-id", launch)
+        self.assertEqual(launch[launch.index("--session-id") + 1], uid)
+        self.assertNotIn("--resume", launch)
+
+    def test_codebuddy_resume_uses_resume_flag(self):
+        launch, uid = self.rt("codebuddy").build_launch_command(
+            ["codebuddy", "--permission-mode", "acceptEdits"], "cb-1",
+        )
+        self.assertEqual(launch[-2:], ["--resume", "cb-1"])
+        self.assertEqual(uid, "cb-1")
+
 
 class JsonlRecoveryTests(unittest.TestCase):
     def runtime(self, root, agent="claude"):
-        settings = SimpleNamespace(state_dir=root, no_reply_token="[NO_REPLY]")
+        settings = SimpleNamespace(
+            state_dir=root,
+            no_reply_token="[NO_REPLY]",
+            workspace=root,
+            codebuddy_state_dir=root / ".codebuddy",
+        )
         return TmuxSessionRuntime(settings, agent)
 
     def test_run_id_from_marker(self):
@@ -129,6 +162,201 @@ class JsonlRecoveryTests(unittest.TestCase):
             self.assertEqual(
                 runtime.find_marked_reply("oc_y", "PLA_REPLY_START_runc", "PLA_REPLY_END_runc"),
                 "codex done",
+            )
+
+    def test_codebuddy_recovery_reads_native_jsonl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime = self.runtime(root, agent="codebuddy")
+            session_name = runtime.session_name("oc_cb")
+            tf = root / "codebuddy.jsonl"
+            tf.write_text(
+                json.dumps({
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "codebuddy done"}],
+                    "message": {"usage": {"output_tokens": 12}},
+                }) + "\n",
+                encoding="utf-8",
+            )
+            runtime.store_run_cursor(session_name, "runcb", str(tf), 0)
+            runtime.capture = lambda _session_name: "❯\n⏵⏵ bypass permissions on\n"  # type: ignore[method-assign]
+
+            self.assertEqual(
+                runtime.find_marked_reply("oc_cb", "PLA_REPLY_START_runcb", "PLA_REPLY_END_runcb"),
+                "codebuddy done",
+            )
+
+    def test_codebuddy_intermediate_assistant_before_tool_is_not_final(self):
+        lines = [
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "Now let me inspect files."}],
+            },
+            {"type": "function_call", "name": "Read", "arguments": "{}"},
+        ]
+
+        self.assertIsNone(codebuddy_reply_from_lines(lines))
+
+    def test_codebuddy_model_from_provider_data(self):
+        lines = [
+            {
+                "type": "message",
+                "role": "assistant",
+                "providerData": {
+                    "model": "claude-opus-4.6-1m",
+                    "requestModelId": "claude-opus-4.6-1m",
+                    "requestModelName": "Claude-Opus-4.6-1M",
+                },
+            }
+        ]
+
+        self.assertEqual(codebuddy_model_from_lines(lines), "claude-opus-4.6-1m")
+
+    def test_codebuddy_detect_model_prefers_jsonl_over_stale_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            transcript = root / "codebuddy.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "providerData": {
+                            "model": "claude-opus-4.6-1m",
+                            "requestModelId": "claude-opus-4.6-1m",
+                            "requestModelName": "Claude-Opus-4.6-1M",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            runtime = TmuxSessionRuntime(
+                SimpleNamespace(
+                    state_dir=root / ".state",
+                    no_reply_token="[NO_REPLY]",
+                    workspace=workspace,
+                    codebuddy_state_dir=root / ".codebuddy",
+                ),
+                "codebuddy",
+            )
+            session_name = runtime.session_name("oc_cb")
+            runtime.write_metadata(session_name, "oc_cb", ["codebuddy"], workspace)
+            runtime._update_metadata(
+                session_name,
+                transcript_path=str(transcript),
+                detected_model="Qwen3.6-35B-A3B",
+            )
+
+            self.assertEqual(runtime.detect_model("oc_cb"), "claude-opus-4.6-1m")
+
+    def test_codebuddy_detect_model_prefers_running_command_over_pre_restart_jsonl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            transcript = root / "codebuddy.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "timestamp": 1_000_000_000_000,
+                        "providerData": {
+                            "model": "claude-opus-4.6-1m",
+                            "requestModelId": "claude-opus-4.6-1m",
+                            "requestModelName": "Claude-Opus-4.6-1M",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            runtime = TmuxSessionRuntime(
+                SimpleNamespace(
+                    state_dir=root / ".state",
+                    no_reply_token="[NO_REPLY]",
+                    workspace=workspace,
+                    codebuddy_state_dir=root / ".codebuddy",
+                ),
+                "codebuddy",
+            )
+            session_name = runtime.session_name("oc_cb")
+            runtime.write_metadata(
+                session_name,
+                "oc_cb",
+                ["codebuddy", "--permission-mode", "bypassPermissions", "--model", "gemini-3.1-pro"],
+                workspace,
+            )
+            runtime._update_metadata(
+                session_name,
+                transcript_path=str(transcript),
+                created_at=2_000_000_000,
+            )
+            runtime.session_exists = lambda _name: True  # type: ignore[method-assign]
+
+            self.assertEqual(runtime.detect_model("oc_cb"), "gemini-3.1-pro")
+
+    def test_codebuddy_detect_effort_reads_running_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            runtime = TmuxSessionRuntime(
+                SimpleNamespace(
+                    state_dir=root / ".state",
+                    no_reply_token="[NO_REPLY]",
+                    workspace=workspace,
+                    codebuddy_state_dir=root / ".codebuddy",
+                ),
+                "codebuddy",
+            )
+            session_name = runtime.session_name("oc_cb")
+            runtime.write_metadata(
+                session_name,
+                "oc_cb",
+                ["codebuddy", "--model", "gemini-3.1-pro", "--effort", "high"],
+                workspace,
+            )
+
+            self.assertEqual(runtime.detect_effort("oc_cb"), "high")
+
+    def test_codebuddy_transcript_cursor_uses_session_jsonl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            codebuddy_dir = root / ".codebuddy"
+            session_id = "11111111-2222-3333-4444-555555555555"
+            project = codebuddy_dir / "projects" / encode_codebuddy_project_dir(workspace)
+            project.mkdir(parents=True)
+            native = project / f"{session_id}.jsonl"
+            native.write_text(
+                json.dumps({"type": "message", "sessionId": session_id, "cwd": str(workspace)}) + "\n",
+                encoding="utf-8",
+            )
+            runtime = TmuxSessionRuntime(
+                SimpleNamespace(
+                    state_dir=root / ".state",
+                    no_reply_token="[NO_REPLY]",
+                    workspace=workspace,
+                    codebuddy_state_dir=codebuddy_dir,
+                ),
+                "codebuddy",
+            )
+            session_name = runtime.session_name("oc_cb")
+            runtime.write_metadata(session_name, "oc_cb", ["codebuddy"], workspace)
+            runtime.store_session_uuid(session_name, session_id)
+
+            self.assertEqual(
+                runtime.transcript_cursor(session_name, "oc_cb", workspace),
+                (str(native), native.stat().st_size),
             )
 
 
@@ -297,6 +525,17 @@ PLA_REPLY_END_x
         self.assertTrue(has_codex_effort_arg(args))
         self.assertEqual(with_codex_effort_arg(args, "xhigh"), args)
 
+    def test_with_codebuddy_effort_arg_adds_flag(self):
+        self.assertEqual(
+            with_codebuddy_effort_arg(["--permission-mode", "acceptEdits"], "xhigh"),
+            ["--permission-mode", "acceptEdits", "--effort", "xhigh"],
+        )
+
+    def test_with_codebuddy_effort_arg_keeps_existing_flag(self):
+        args = ["--effort", "high"]
+        self.assertTrue(has_codebuddy_effort_arg(args))
+        self.assertEqual(with_codebuddy_effort_arg(args, "xhigh"), args)
+
     def test_codex_command_uses_agent_proxy_prefix(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -333,6 +572,27 @@ PLA_REPLY_END_x
             self.assertEqual(command[:2], ["env", "http_proxy=http://127.0.0.1:7899"])
             self.assertIn("claude", command)
             self.assertIn("--permission-mode", command)
+
+    def test_codebuddy_command_uses_session_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = SimpleNamespace(
+                codebuddy_cmd="codebuddy",
+                codebuddy_session_args=("--permission-mode", "acceptEdits"),
+                codebuddy_model="gpt-5.5",
+                codebuddy_default_effort="xhigh",
+                agent_proxy_url="http://127.0.0.1:7899",
+                no_proxy="localhost",
+            )
+            runtime = TmuxSessionRuntime(settings, "codebuddy")
+
+            command = runtime.command(root)
+
+            self.assertEqual(command[:2], ["env", "http_proxy=http://127.0.0.1:7899"])
+            self.assertIn("codebuddy", command)
+            self.assertIn("--permission-mode", command)
+            self.assertIn("--model", command)
+            self.assertIn("--effort", command)
 
     def test_session_command_matches_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -511,6 +771,23 @@ PLA_REPLY_END_x
             self.assertTrue(unrelated.exists())
             self.assertEqual(history.read_text(encoding="utf-8").strip(), json.dumps({"session_id": "keep", "text": "other"}))
 
+    def test_codex_state_dir_prefers_extra_env_codex_home(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = SimpleNamespace(
+                state_dir=root / ".state",
+                workspace=root,
+                no_reply_token="[NO_REPLY]",
+                codex_state_dir=root / ".codex",
+            )
+            runtime = TmuxSessionRuntime(
+                settings,
+                "codex",
+                extra_env={"CODEX_HOME": str(root / ".codex-gptpro")},
+            )
+
+            self.assertEqual(runtime.codex_state_dir(), (root / ".codex-gptpro").resolve())
+
     def test_reset_session_deletes_matching_claude_session_jsonl_and_process_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -576,6 +853,61 @@ PLA_REPLY_END_x
             commands = [call.args[0] for call in run.call_args_list]
             self.assertIn(["tmux", "send-keys", "-t", "pla-codex-oc", "C-u"], commands)
             self.assertIn(["tmux", "paste-buffer", "-p", "-t", "pla-codex-oc"], commands)
+
+    def test_codebuddy_paste_and_submit_retries_when_input_still_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = SimpleNamespace(
+                state_dir=root / ".state",
+                workspace=root,
+                no_reply_token="[NO_REPLY]",
+                session_capture_lines=20000,
+            )
+            runtime = TmuxSessionRuntime(settings, "codebuddy")
+
+            with (
+                patch("subprocess.run") as run,
+                patch.object(runtime, "auto_confirm_prompt_if_visible", return_value=False),
+                patch.object(
+                    runtime,
+                    "capture",
+                    side_effect=[
+                        "> Message: Feishu handoff text ↵ send\n⏵⏵ bypass permissions on",
+                        "✸ Working... esc to interrupt",
+                    ],
+                ),
+                patch("paper_lark_agents.tmux_runtime.time.sleep"),
+            ):
+                runtime.paste_and_submit("pla-codebuddy-oc", "line 1\nline 2")
+
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertIn(["tmux", "send-keys", "-t", "pla-codebuddy-oc", "C-a", "C-k"], commands)
+            enter_count = commands.count(["tmux", "send-keys", "-t", "pla-codebuddy-oc", "Enter"])
+            self.assertEqual(enter_count, 2)
+
+    def test_codebuddy_paste_and_submit_does_not_retry_empty_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = SimpleNamespace(
+                state_dir=root / ".state",
+                workspace=root,
+                no_reply_token="[NO_REPLY]",
+                session_capture_lines=20000,
+            )
+            runtime = TmuxSessionRuntime(settings, "codebuddy")
+
+            with (
+                patch("subprocess.run") as run,
+                patch.object(runtime, "auto_confirm_prompt_if_visible", return_value=False),
+                patch.object(runtime, "capture", return_value=">\n⏵⏵ bypass permissions on"),
+                patch("paper_lark_agents.tmux_runtime.time.sleep"),
+            ):
+                runtime.paste_and_submit("pla-codebuddy-oc", "line 1\nline 2")
+
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertIn(["tmux", "send-keys", "-t", "pla-codebuddy-oc", "C-a", "C-k"], commands)
+            enter_count = commands.count(["tmux", "send-keys", "-t", "pla-codebuddy-oc", "Enter"])
+            self.assertEqual(enter_count, 1)
 
     def test_capture_with_transcript_includes_tail_for_scrolled_claude_markers(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -804,6 +1136,58 @@ PLA_REPLY_END_x
         self.assertTrue(session_ready_for_input("› Message", "codex"))
         self.assertTrue(session_ready_for_input("98% context left", "codex"))
         self.assertFalse(session_ready_for_input("OpenAI Codex", "codex"))
+
+    def test_session_ready_for_current_input_rejects_codex_model_loading(self):
+        text = """
+╭───────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.139.0)                        │
+│ model:     loading   /model to change             │
+╰───────────────────────────────────────────────────╯
+› Explain this codebase
+"""
+
+        self.assertFalse(session_ready_for_current_input(text, "codex"))
+
+    def test_session_ready_for_current_input_detects_codebuddy_prompt(self):
+        text = """
+● Read(python/agent_loop.py)
+────────────────────────────────────────────────────────────────
+> Implement recent-window baseline for Qwen testing ↵ send
+────────────────────────────────────────────────────────────────
+⏵⏵ bypass permissions on (shift+tab to cycle)
+"""
+
+        self.assertTrue(session_ready_for_current_input(text, "codebuddy"))
+
+    def test_session_ready_for_current_input_rejects_busy_codebuddy(self):
+        text = """
+● Read(python/agent_loop.py)
+✸ Browsing… (4s · writing Read · ↓ 44 tokens · esc to interrupt)
+────────────────────────────────────────────────────────────────
+>
+⏵⏵ bypass permissions on (shift+tab to cycle)
+"""
+
+        self.assertFalse(session_ready_for_current_input(text, "codebuddy"))
+
+    def test_codebuddy_prompt_has_pending_input_detects_non_empty_send_line(self):
+        text = """
+● Read(python/agent_loop.py)
+────────────────────────────────────────────────────────────────
+> Monitor partial rows growth rate next 15 minutes ↵ send
+────────────────────────────────────────────────────────────────
+⏵⏵ bypass permissions on (shift+tab to cycle)
+"""
+
+        self.assertTrue(codebuddy_prompt_has_pending_input(text))
+
+    def test_codebuddy_prompt_has_pending_input_rejects_empty_or_busy_prompt(self):
+        self.assertFalse(codebuddy_prompt_has_pending_input(">\n⏵⏵ bypass permissions on"))
+        self.assertFalse(
+            codebuddy_prompt_has_pending_input(
+                "✸ Browsing... esc to interrupt\n> queued text ↵ send\n⏵⏵ bypass permissions on"
+            )
+        )
 
     def test_parse_codex_model_from_footer(self):
         text = "› Write tests\n\n  gpt-5.5 xhigh · /workspace/project\n"

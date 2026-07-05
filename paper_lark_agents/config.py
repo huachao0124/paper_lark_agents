@@ -10,7 +10,7 @@ from .effort import EffortError, normalize_effort
 from .responders import ResponderError, normalize_responder
 
 
-AgentMode = Literal["codex", "claude", "both", "tasks", "gpt-pro"]
+AgentMode = Literal["codex", "claude", "both", "tasks", "gpt-pro", "codebuddy"]
 
 
 def load_env_file(path: str | os.PathLike[str] | None) -> None:
@@ -94,7 +94,13 @@ def _csv(name: str, default: str = "") -> tuple[str, ...]:
 
 
 def _paths(name: str, default: tuple[Path, ...]) -> tuple[Path, ...]:
-    values = _csv(name)
+    raw = _env(name)
+    values = tuple(
+        item.strip()
+        for part in raw.split(",")
+        for item in part.split(os.pathsep)
+        if item.strip()
+    )
     if not values:
         return default
     return tuple(Path(value).expanduser().resolve() for value in values)
@@ -176,6 +182,15 @@ class Settings:
     claude_model: str | None
     claude_default_effort: str | None
     claude_timeout: int
+    codebuddy_cmd: str
+    codebuddy_args: tuple[str, ...]
+    codebuddy_runtime: str
+    codebuddy_session_args: tuple[str, ...]
+    codebuddy_startup_commands: tuple[str, ...]
+    codebuddy_state_dir: Path
+    codebuddy_model: str | None
+    codebuddy_default_effort: str | None
+    codebuddy_timeout: int
     task_as: str
     tasklist_id: str | None
     respond_to_all: bool
@@ -221,6 +236,7 @@ class Settings:
     gpt_pro_task_name: str
     gpt_pro_runtime: str
     gpt_pro_codex_home: str | None
+    deployed_agents: tuple[str, ...]
 
 
 def load_settings(env_file: str | None = ".env") -> Settings:
@@ -228,13 +244,15 @@ def load_settings(env_file: str | None = ".env") -> Settings:
     workspace = Path(_env("PLA_WORKSPACE", os.getcwd())).expanduser().resolve()
     event_key = _env("PLA_EVENT_KEY", "im.message.receive_v1")
     agent_mode = _env("PLA_AGENT_MODE", "both").strip().lower()
-    if agent_mode not in {"codex", "claude", "both", "tasks", "gpt-pro"}:
+    if agent_mode not in {"codex", "claude", "both", "tasks", "gpt-pro", "codebuddy"}:
         agent_mode = "both"
     bot_aliases = _csv("PLA_BOT_ALIASES")
     if not bot_aliases and agent_mode == "codex":
         bot_aliases = ("Codex",)
     if not bot_aliases and agent_mode == "claude":
         bot_aliases = ("Claude Code", "Claude")
+    if not bot_aliases and agent_mode == "codebuddy":
+        bot_aliases = ("CodeBuddy", "codebuddy")
     return Settings(
         lark_cli=_env("PLA_LARK_CLI", "lark-cli"),
         lark_profile=_optional("PLA_LARK_PROFILE"),
@@ -294,6 +312,23 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         claude_model=_optional("PLA_CLAUDE_MODEL"),
         claude_default_effort=_effort("PLA_CLAUDE_DEFAULT_EFFORT"),
         claude_timeout=_int("PLA_CLAUDE_TIMEOUT", 900),
+        codebuddy_cmd=_env("PLA_CODEBUDDY_CMD", "codebuddy"),
+        codebuddy_args=_args(
+            "PLA_CODEBUDDY_ARGS",
+            "-p --output-format text",
+        ),
+        codebuddy_runtime=_env("PLA_CODEBUDDY_RUNTIME", "session").strip().lower(),
+        codebuddy_session_args=_args(
+            "PLA_CODEBUDDY_SESSION_ARGS",
+            "--permission-mode acceptEdits",
+        ),
+        codebuddy_startup_commands=_csv("PLA_CODEBUDDY_STARTUP_COMMANDS"),
+        codebuddy_state_dir=Path(
+            _env("PLA_CODEBUDDY_STATE_DIR", os.environ.get("CODEBUDDY_HOME", "~/.codebuddy"))
+        ).expanduser().resolve(),
+        codebuddy_model=_optional("PLA_CODEBUDDY_MODEL"),
+        codebuddy_default_effort=_effort("PLA_CODEBUDDY_DEFAULT_EFFORT"),
+        codebuddy_timeout=_int("PLA_CODEBUDDY_TIMEOUT", 900),
         task_as=_env("PLA_TASK_AS", "user"),
         tasklist_id=_optional("PLA_TASKLIST_ID"),
         respond_to_all=_bool("PLA_RESPOND_TO_ALL", False),
@@ -315,7 +350,7 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         enable_memory=_bool("PLA_ENABLE_MEMORY", True),
         state_dir=Path(_env("PLA_STATE_DIR", ".state")).expanduser().resolve(),
         memory_turns=_int("PLA_MEMORY_TURNS", 24),
-        memory_chars=_int("PLA_MEMORY_CHARS", 9000),
+        memory_chars=_int("PLA_MEMORY_CHARS", 0),
         outbox_ttl_seconds=_int("PLA_OUTBOX_TTL_SECONDS", 86400),
         enable_agent_discussion=_bool("PLA_ENABLE_AGENT_DISCUSSION", True),
         direct_agent_handoff=_bool("PLA_DIRECT_AGENT_HANDOFF", True),
@@ -339,6 +374,12 @@ def load_settings(env_file: str | None = ".env") -> Settings:
         gpt_pro_task_name=os.environ.get("PLA_GPT_PRO_TASK_NAME", "debug"),
         gpt_pro_runtime=os.environ.get("PLA_GPT_PRO_RUNTIME", "api"),
         gpt_pro_codex_home=_optional("PLA_GPT_PRO_CODEX_HOME"),
+        # Agents that have a bridge somewhere in this deployment. Used so an
+        # auto-responder switch only points at a real, deployed agent. Defaults
+        # to the always-on pair; operators running codebuddy add it here.
+        deployed_agents=tuple(
+            a.strip() for a in os.environ.get("PLA_DEPLOYED_AGENTS", "codex,claude").split(",") if a.strip()
+        ),
     )
 
 
@@ -346,6 +387,6 @@ def valid_agents(values: tuple[str, ...]) -> tuple[str, ...]:
     result: list[str] = []
     for value in values:
         agent = value.strip().lower()
-        if agent in {"codex", "claude"} and agent not in result:
+        if agent in {"codex", "claude", "codebuddy"} and agent not in result:
             result.append(agent)
     return tuple(result)

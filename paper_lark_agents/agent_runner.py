@@ -32,8 +32,10 @@ class AgentRunner:
         suffix = settings.session_suffix
         codex_sid = f"codex-{suffix}" if suffix else None
         claude_sid = f"claude-{suffix}" if suffix else None
+        codebuddy_sid = f"codebuddy-{suffix}" if suffix else None
         self.codex_session = TmuxSessionRuntime(settings, "codex", session_id=codex_sid)
         self.claude_session = TmuxSessionRuntime(settings, "claude", session_id=claude_sid)
+        self.codebuddy_session = TmuxSessionRuntime(settings, "codebuddy", session_id=codebuddy_sid)
         # GPT-Pro as an isolated codex session (separate CODEX_HOME + internal
         # API key), so it has codex's tools without touching the subscription
         # codex session. Only built when PLA_GPT_PRO_RUNTIME=codex.
@@ -172,6 +174,48 @@ class AgentRunner:
         )
         return AgentResult("Claude Code", text)
 
+    def run_codebuddy(
+        self,
+        prompt: str,
+        chat_id: str | None = None,
+        session_context: str | None = None,
+        workspace: Path | None = None,
+        model: str | None = None,
+        effort: str | None = None,
+        progress_callback: Callable[[str], None] | None = None,
+        run_id: str | None = None,
+    ) -> AgentResult:
+        if self.settings.codebuddy_runtime == "session":
+            if not chat_id:
+                raise AgentError("CodeBuddy session runtime requires chat_id.")
+            try:
+                reply = self.codebuddy_session.run(
+                    chat_id,
+                    prompt,
+                    self.settings.codebuddy_timeout,
+                    session_context=session_context,
+                    workspace=workspace,
+                    model=model,
+                    effort=effort,
+                    progress_callback=progress_callback,
+                    progress_interval=self.settings.status_update_seconds,
+                    run_id=run_id,
+                )
+            except TmuxReplyStillRunning as exc:
+                raise AgentStillRunning(str(exc)) from exc
+            except (TmuxRuntimeError, subprocess.CalledProcessError, FileNotFoundError) as exc:
+                raise AgentError(str(exc)) from exc
+            return AgentResult("CodeBuddy", reply.text, reply.usage, reply.transcript_path, reply.transcript_offset)
+        text = self._run(
+            name="CodeBuddy",
+            executable=self.settings.codebuddy_cmd,
+            args=self.settings.codebuddy_args,
+            prompt=prompt,
+            timeout=self.settings.codebuddy_timeout,
+            workspace=workspace,
+        )
+        return AgentResult("CodeBuddy", text)
+
     def send_session_command(
         self,
         agent: str,
@@ -189,6 +233,10 @@ class AgentRunner:
             if self.settings.claude_runtime != "session":
                 return False
             runtime = self.claude_session
+        elif agent == "codebuddy":
+            if self.settings.codebuddy_runtime != "session":
+                return False
+            runtime = self.codebuddy_session
         else:
             raise AgentError(f"Unknown agent: {agent}")
         try:
@@ -211,6 +259,10 @@ class AgentRunner:
             if self.settings.claude_runtime != "session":
                 return False
             runtime = self.claude_session
+        elif agent == "codebuddy":
+            if self.settings.codebuddy_runtime != "session":
+                return False
+            runtime = self.codebuddy_session
         else:
             raise AgentError(f"Unknown agent: {agent}")
         try:
@@ -236,6 +288,10 @@ class AgentRunner:
             if self.settings.claude_runtime != "session":
                 return None, False
             runtime = self.claude_session
+        elif agent == "codebuddy":
+            if self.settings.codebuddy_runtime != "session":
+                return None, False
+            runtime = self.codebuddy_session
         else:
             raise AgentError(f"Unknown agent: {agent}")
         workspace = (workspace or self.settings.workspace).expanduser().resolve()
@@ -251,6 +307,8 @@ class AgentRunner:
         Used by recovery/interactive paths that already assume session mode."""
         if agent == "gpt-pro":
             return self.gptpro_session or self.codex_session
+        if agent == "codebuddy":
+            return self.codebuddy_session
         if agent == "claude":
             return self.claude_session
         return self.codex_session
@@ -262,6 +320,8 @@ class AgentRunner:
             return self.codex_session if self.settings.codex_runtime == "session" else None
         if agent == "claude":
             return self.claude_session if self.settings.claude_runtime == "session" else None
+        if agent == "codebuddy":
+            return self.codebuddy_session if self.settings.codebuddy_runtime == "session" else None
         if agent == "gpt-pro":
             return self.gptpro_session  # None unless PLA_GPT_PRO_RUNTIME=codex
         return None
@@ -271,6 +331,8 @@ class AgentRunner:
             return self.codex_session.session_name(chat_id)
         if agent == "claude":
             return self.claude_session.session_name(chat_id)
+        if agent == "codebuddy":
+            return self.codebuddy_session.session_name(chat_id)
         if agent == "gpt-pro" and self.gptpro_session:
             return self.gptpro_session.session_name(chat_id)
         raise AgentError(f"Unknown agent: {agent}")
@@ -280,6 +342,8 @@ class AgentRunner:
             return self.codex_session.reply_markers(run_id)
         if agent == "claude":
             return self.claude_session.reply_markers(run_id)
+        if agent == "codebuddy":
+            return self.codebuddy_session.reply_markers(run_id)
         if agent == "gpt-pro" and self.gptpro_session:
             return self.gptpro_session.reply_markers(run_id)
         raise AgentError(f"Unknown agent: {agent}")

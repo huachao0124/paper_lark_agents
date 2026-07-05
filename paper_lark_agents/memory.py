@@ -33,10 +33,10 @@ class MemoryEntry:
 
 
 class ChatMemory:
-    def __init__(self, state_dir: Path, max_turns: int = 24, max_chars: int = 9000):
+    def __init__(self, state_dir: Path, max_turns: int = 24, max_chars: int = 0):
         self.state_dir = state_dir
         self.max_turns = max(2, max_turns)
-        self.max_chars = max(1000, max_chars)
+        self.max_chars = max_chars
 
     def append_user(self, event: MessageEvent, routed_text: str) -> None:
         content = routed_text or event.content
@@ -59,22 +59,61 @@ class ChatMemory:
     def append_assistant(self, chat_id: str, agent: str, content: str) -> None:
         # Dedup: two processes (codex + claude) share this file, and multiple
         # code paths (dispatch, handoff, followup, pending-run recovery) can
-        # write the same reply. Skip if the last entry is identical.
+        # write the same reply. Look back over recent entries — skipping
+        # content-less markers like agent_seen, which land between the two
+        # writes and would defeat a last-entry-only check.
         entries = self._read(chat_id)
-        if entries:
-            last = entries[-1]
+        for prior in reversed(entries[-6:]):
+            if not str(prior.get("content") or "").strip():
+                continue
             if (
-                last.get("role") == "assistant"
-                and last.get("agent") == agent
-                and last.get("content") == content
+                prior.get("role") == "assistant"
+                and prior.get("agent") == agent
+                and prior.get("content") == content
             ):
                 return
+            break
         self._append(
             chat_id,
             MemoryEntry(
                 role="assistant",
                 agent=agent,
                 content=content,
+            ),
+        )
+
+    def mark_agent_seen(
+        self,
+        chat_id: str,
+        agent: str,
+        *,
+        message_id: str | None = None,
+        event_id: str | None = None,
+    ) -> None:
+        """Record that an agent has received the room context without speaking.
+
+        [NO_REPLY] should not become visible room memory, but it still means the
+        agent saw the recap. This marker advances unseen_context() for that
+        agent while remaining invisible in context().
+        """
+        entries = self._read(chat_id)
+        if entries:
+            last = entries[-1]
+            if (
+                last.get("role") == "agent_seen"
+                and last.get("agent") == agent
+                and last.get("message_id") == message_id
+                and last.get("event_id") == event_id
+            ):
+                return
+        self._append(
+            chat_id,
+            MemoryEntry(
+                role="agent_seen",
+                agent=agent,
+                content="",
+                message_id=message_id,
+                event_id=event_id,
             ),
         )
 
@@ -93,14 +132,13 @@ class ChatMemory:
                 if exclude_agent and entry.get("agent") == exclude_agent:
                     continue
                 name = str(entry.get("agent") or "assistant")
+            elif role == "user":
+                name = "用户"
             else:
-                name = str(entry.get("sender_id") or "user")
+                continue
             lines.append(f"{name}: {content}")
 
-        text = "\n\n".join(lines)
-        if len(text) <= self.max_chars:
-            return text
-        return text[-self.max_chars :]
+        return "\n\n".join(lines)
 
     def unseen_context(self, chat_id: str, agent: str) -> str:
         """Return only messages that happened AFTER this agent's last turn.
@@ -113,10 +151,20 @@ class ChatMemory:
             return ""
         last_own_idx = -1
         for idx in range(len(entries) - 1, -1, -1):
-            if entries[idx].get("role") == "assistant" and entries[idx].get("agent") == agent:
+            if self._is_seen_boundary(entries[idx], agent):
                 last_own_idx = idx
                 break
         after = entries[last_own_idx + 1:] if last_own_idx >= 0 else entries
+        # Drop the last user entry — it's the current message (just appended
+        # by handle_event before dispatch), which will be delivered separately
+        # as the turn prompt. Skip trailing content-less markers (agent_seen
+        # from the other bridge process) that may land between the append and
+        # this read.
+        idx = len(after) - 1
+        while idx >= 0 and not str(after[idx].get("content") or "").strip():
+            idx -= 1
+        if idx >= 0 and after[idx].get("role") == "user":
+            after = after[:idx]
         lines: list[str] = []
         for entry in after:
             content = str(entry.get("content") or "").strip()
@@ -126,16 +174,17 @@ class ChatMemory:
             if role == "assistant":
                 if entry.get("agent") == agent:
                     continue
+                if entry.get("agent") == "bridge":
+                    continue
                 name = str(entry.get("agent") or "assistant")
+            elif role == "user":
+                name = "用户"
             else:
-                name = str(entry.get("sender_id") or "user")
+                continue
             lines.append(f"{name}: {content}")
         if not lines:
             return ""
-        text = "\n\n".join(lines)
-        if len(text) <= self.max_chars:
-            return text
-        return text[-self.max_chars :]
+        return "\n\n".join(lines)
 
     def has_unseen_peer_turns(self, chat_id: str, agent: str) -> bool:
         """Whether another agent replied in this chat since this agent's last turn.
@@ -148,11 +197,16 @@ class ChatMemory:
         entries = self._read(chat_id)
         for entry in reversed(entries):
             role = entry.get("role")
-            if role == "assistant" and entry.get("agent") == agent:
+            if self._is_seen_boundary(entry, agent):
                 return False  # reached this agent's last turn — no unseen peer turns
             if role == "assistant" and entry.get("agent") and entry.get("agent") != agent:
                 return True   # found a peer turn before this agent's last turn
         return False
+
+    def _is_seen_boundary(self, entry: dict[str, Any], agent: str) -> bool:
+        if entry.get("agent") != agent:
+            return False
+        return entry.get("role") in {"assistant", "agent_seen"}
 
     def clear(self, chat_id: str) -> bool:
         path = self._chat_dir(chat_id) / "history.jsonl"

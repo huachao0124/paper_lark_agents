@@ -14,18 +14,16 @@ def agent_session_context_prompt(
     handoff_block = ""
     if peer_name:
         handoff_block = (
-            f"- IMPORTANT: {peer_name} can ONLY see your reply if you include "
-            f'"@{peer_name}" in it. Without the @, your message is invisible to them.\n'
-            f"- When to @: whenever your reply contains something {peer_name} should "
-            "know, review, build on, or disagree with — a finding, a decision, a question, "
-            "a code change, a claim that deserves a second opinion. Integrate the @ naturally "
-            f'(e.g. "@{peer_name} 你看下这个结论" or "我改了 X，@{peer_name} 帮我验一下").\n'
-            f"- When NOT to @: when a human asked you a direct question and your answer is "
-            "purely for them (a summary, a status update, an acknowledgement), or when you "
-            f"and {peer_name} have already converged and there is nothing left to discuss.\n"
-            "- If after a couple of rounds you still disagree without converging, do not "
-            "keep going back and forth — summarize both positions and put a clear question "
-            "to the group to decide.\n"
+            f"- Teammates: {peer_name}. Including \"@<name>\" in your reply forwards "
+            "it to that teammate.\n"
+            "- @ when you need a teammate to: execute code/commands, verify or review "
+            "your work, provide information you lack, or continue a discussion where "
+            "you have a substantive question or disagreement for them.\n"
+            "- Do NOT @ just to agree, acknowledge, summarize what you did, or repeat "
+            "what they already said. Only @ when there is something actionable or "
+            "debatable for the other side.\n"
+            "- If after 2 rounds you and a teammate still disagree, stop — summarize "
+            "both positions for the group and let the humans decide.\n"
         )
     return f"""Session setup for {agent_name}.
 
@@ -63,23 +61,13 @@ def agent_session_turn_prompt(
     source_agent: str | None = None,
     room_recap: str = "",
 ) -> str:
-    source = f"assistant:{source_agent}" if source_agent else "human"
     recap_block = ""
     if room_recap:
-        recap_block = (
-            "Recent conversation in this Feishu room — you may not have seen all "
-            "of it, because some turns were handled by your teammate while you "
-            "stayed quiet. Use it to understand what the humans actually asked "
-            f"for:\n{room_recap}\n\n---\n\n"
-        )
-    return f"""{recap_block}Feishu message:
-source: {source}
-chat_id: {event.chat_id}
-sender_open_id: {event.sender_id}
-message_id: {event.message_id}
-
-content:
-{user_text}
+        recap_block = f"{room_recap}\n\n---\n\n"
+    if source_agent:
+        return f"""{recap_block}[{source_agent}] {user_text}
+"""
+    return f"""{recap_block}{user_text}
 """
 
 

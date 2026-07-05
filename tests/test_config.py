@@ -93,13 +93,51 @@ class ConfigTests(unittest.TestCase):
                 os.environ,
                 {
                     "PLA_WORKSPACE": tmp,
-                    "PLA_WORKSPACE_WARMUP_AGENTS": "codex,claude,unknown,codex",
+                    "PLA_WORKSPACE_WARMUP_AGENTS": "codex,claude,codebuddy,unknown,codex",
                 },
                 clear=True,
             ):
                 settings = load_settings(None)
 
-        self.assertEqual(settings.workspace_warmup_agents, ("codex", "claude"))
+        self.assertEqual(settings.workspace_warmup_agents, ("codex", "claude", "codebuddy"))
+
+    def test_workspace_roots_accept_comma_and_pathsep(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            a = root / "a"
+            b = root / "b"
+            c = root / "c"
+            with patch.dict(
+                os.environ,
+                {
+                    "PLA_WORKSPACE": str(a),
+                    "PLA_WORKSPACE_ROOTS": f"{a},{b}{os.pathsep}{c}",
+                },
+                clear=True,
+            ):
+                settings = load_settings(None)
+
+        self.assertEqual(settings.workspace_roots, (a.resolve(), b.resolve(), c.resolve()))
+
+    def test_codebuddy_mode_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(
+                os.environ,
+                {
+                    "PLA_WORKSPACE": tmp,
+                    "PLA_AGENT_MODE": "codebuddy",
+                    "PLA_CODEBUDDY_DEFAULT_EFFORT": "xhigh",
+                },
+                clear=True,
+            ):
+                settings = load_settings(None)
+
+        self.assertEqual(settings.agent_mode, "codebuddy")
+        self.assertEqual(settings.bot_aliases, ("CodeBuddy", "codebuddy"))
+        self.assertEqual(settings.codebuddy_cmd, "codebuddy")
+        self.assertEqual(settings.codebuddy_runtime, "session")
+        self.assertEqual(settings.codebuddy_session_args, ("--permission-mode", "acceptEdits"))
+        self.assertEqual(settings.codebuddy_default_effort, "xhigh")
 
     def test_session_capture_and_history_defaults_cover_long_tui_output(self):
         with tempfile.TemporaryDirectory() as tmp:

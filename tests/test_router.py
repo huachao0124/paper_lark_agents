@@ -1,6 +1,6 @@
 import unittest
 
-from paper_lark_agents.router import addressed_agents, parse_task_request, route_message
+from paper_lark_agents.router import addressed_agent_sequence, addressed_agents, parse_task_request, route_message
 
 
 class AddressedAgentsTests(unittest.TestCase):
@@ -14,11 +14,33 @@ class AddressedAgentsTests(unittest.TestCase):
     def test_at_claude_code_form(self):
         self.assertEqual(addressed_agents("@Claude Code 接一下"), {"claude"})
 
+    def test_at_codebuddy_detected(self):
+        self.assertEqual(addressed_agents("@CodeBuddy 接一下"), {"codebuddy"})
+        self.assertEqual(addressed_agents("@Code Buddy 接一下"), {"codebuddy"})
+
     def test_passing_mention_without_at_is_ignored(self):
         self.assertEqual(addressed_agents("这点和 Codex 之前说的一样"), set())
 
+    def test_at_word_starting_with_agent_name_not_matched(self):
+        # Ordinary @-words that merely START with an agent name must not match,
+        # or they would flip the chat's default responder. Trailing letters
+        # break the match; hyphen/punctuation (alias forms) still match.
+        self.assertEqual(addressed_agents("@codexified results look good"), set())
+        self.assertEqual(addressed_agents("@claudebot ping"), set())
+        self.assertEqual(addressed_agents("@codex-cvm 你看下"), {"codex"})
+        self.assertEqual(addressed_agents("@codex, 看看"), {"codex"})
+
     def test_both_addressed(self):
-        self.assertEqual(addressed_agents("@Codex @Claude 你俩都看下"), {"codex", "claude"})
+        self.assertEqual(
+            addressed_agents("@Codex @Claude @CodeBuddy 你们都看下"),
+            {"codex", "claude", "codebuddy"},
+        )
+
+    def test_addressed_sequence_preserves_order(self):
+        self.assertEqual(
+            addressed_agent_sequence("@Codex 先看 @Claude 再补 @CodeBuddy 收尾"),
+            ("codex", "claude", "codebuddy"),
+        )
 
     def test_empty(self):
         self.assertEqual(addressed_agents(""), set())
@@ -97,11 +119,126 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(route.text, "critique this")
         self.assertFalse(route.broadcast)
 
+    def test_middle_mention_routes_to_addressed_agent(self):
+        text = "这个问题 @Claude 看看"
+        route = route_message(
+            text,
+            respond_to_all=True,
+            enabled_agents=("claude",),
+            bot_aliases=("Claude",),
+            default_agent="claude",
+            strict_alias=True,
+        )
+        self.assertEqual(route.kind, "agent")
+        self.assertEqual(route.agent, "claude")
+        self.assertEqual(route.text, text)
+        self.assertFalse(route.broadcast)
+
+    def test_middle_mention_to_other_agent_is_ignored_in_strict_process(self):
+        route = route_message(
+            "这个问题 @Claude 看看",
+            respond_to_all=True,
+            enabled_agents=("codex",),
+            bot_aliases=("Codex",),
+            default_agent="codex",
+            strict_alias=True,
+        )
+        self.assertEqual(route.kind, "ignore")
+
+    def test_custom_alias_with_other_mentions_still_served(self):
+        # A bot addressed by its CUSTOM alias must be served even when the
+        # message also @-mentions agents this process does not run — the
+        # message was explicitly for this bot.
+        route = route_message(
+            "@codex-cvm 你先看 但 @Claude @CodeBuddy 你们也补充",
+            respond_to_all=False,
+            enabled_agents=("codex",),
+            bot_aliases=("codex-cvm",),
+            default_agent="codex",
+            strict_alias=True,
+        )
+        self.assertEqual(route.kind, "agent")
+        self.assertEqual(route.agent, "codex")
+
+    def test_multiple_mentions_route_full_message_to_all_enabled_targets(self):
+        text = "这个问题 @Codex @Claude 都看看"
+        route = route_message(
+            text,
+            respond_to_all=True,
+            enabled_agents=("codex", "claude"),
+            default_agent=None,
+        )
+        self.assertEqual(route.kind, "multi_agent")
+        self.assertEqual(route.agent_texts, {"codex": text, "claude": text})
+        self.assertFalse(route.broadcast)
+
+    def test_multiple_mentions_route_to_each_strict_single_agent_process(self):
+        text = "@Codex @Claude 都看看"
+        r_codex = route_message(
+            text,
+            respond_to_all=True,
+            enabled_agents=("codex",),
+            bot_aliases=("Codex",),
+            default_agent="codex",
+            strict_alias=True,
+        )
+        self.assertEqual(r_codex.kind, "agent")
+        self.assertEqual(r_codex.agent, "codex")
+        self.assertEqual(r_codex.text, text)
+
+        r_claude = route_message(
+            text,
+            respond_to_all=True,
+            enabled_agents=("claude",),
+            bot_aliases=("Claude",),
+            default_agent="claude",
+            strict_alias=True,
+        )
+        self.assertEqual(r_claude.kind, "agent")
+        self.assertEqual(r_claude.agent, "claude")
+        self.assertEqual(r_claude.text, text)
+
+    def test_only_disabled_mentions_are_ignored(self):
+        route = route_message(
+            "这个问题 @CodeBuddy 看看",
+            respond_to_all=True,
+            enabled_agents=("codex",),
+            bot_aliases=("Codex",),
+            default_agent="codex",
+            strict_alias=True,
+        )
+        self.assertEqual(route.kind, "ignore")
+
     def test_claude_route(self):
         route = route_message("claude: summarize limitations")
         self.assertEqual(route.kind, "agent")
         self.assertEqual(route.agent, "claude")
         self.assertEqual(route.text, "summarize limitations")
+
+    def test_codebuddy_route(self):
+        route = route_message("/codebuddy implement the fix", enabled_agents=("codebuddy",))
+        self.assertEqual(route.kind, "agent")
+        self.assertEqual(route.agent, "codebuddy")
+        self.assertEqual(route.text, "implement the fix")
+
+    def test_codebuddy_session_command(self):
+        route = route_message("@CodeBuddy /effort xhigh", enabled_agents=("codebuddy",))
+        self.assertEqual(route.kind, "session_command")
+        self.assertEqual(route.agent, "codebuddy")
+        self.assertEqual(route.text, "/effort xhigh")
+
+    def test_codebuddy_strict_alias_routes_to_default_agent(self):
+        route = route_message(
+            "@CodeBuddy implement it",
+            respond_to_all=True,
+            enabled_agents=("codebuddy",),
+            bot_aliases=("CodeBuddy", "codebuddy"),
+            default_agent="codebuddy",
+            strict_alias=True,
+        )
+        self.assertEqual(route.kind, "agent")
+        self.assertEqual(route.agent, "codebuddy")
+        self.assertEqual(route.text, "implement it")
 
     def test_bare_claude_name_broadcasts_full_text_to_default_agent(self):
         route = route_message(
@@ -314,17 +451,25 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(route.kind, "clear")
         self.assertEqual(route.text, "init")
 
-    def test_workspace_route_after_bot_alias_is_session_command(self):
+    def test_workspace_route_after_bot_alias_is_addressed_workspace(self):
+        # Bridge-owned commands win over raw session-command forwarding —
+        # the CLIs have no /workspace, and the addressed flag lets a
+        # non-management bot handle it in groups without the managing bot.
         route = route_message(
-            "@Codex /workspace",
+            "@Codex /workspace papers/x",
             respond_to_all=True,
             enabled_agents=("codex",),
             bot_aliases=("Codex",),
             default_agent="codex",
         )
-        self.assertEqual(route.kind, "session_command")
-        self.assertEqual(route.agent, "codex")
-        self.assertEqual(route.text, "/workspace")
+        self.assertEqual(route.kind, "workspace")
+        self.assertEqual(route.text, "papers/x")
+        self.assertTrue(route.addressed)
+
+    def test_bare_workspace_route_is_not_addressed(self):
+        route = route_message("/workspace papers/x", respond_to_all=True)
+        self.assertEqual(route.kind, "workspace")
+        self.assertFalse(route.addressed)
 
     def test_task_parser_with_extra_description(self):
         task = parse_task_request("Run ablation | include seed variance")
@@ -407,6 +552,8 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(list(r_codex.agent_texts.keys()), ["codex"])
         r_gpt = route_message("/both 看法", enabled_agents=("gpt-pro",), bot_aliases=("gpt-pro",), default_agent="gpt-pro", strict_alias=True)
         self.assertEqual(r_gpt.kind, "ignore")
+        r_codebuddy = route_message("/both 看法", enabled_agents=("codebuddy",))
+        self.assertEqual(r_codebuddy.kind, "ignore")
 
     def test_all_includes_gpt_pro(self):
         # /all reaches every bridge, gpt-pro included.
@@ -416,6 +563,9 @@ class RouterTests(unittest.TestCase):
         r_codex = route_message("/all 看法", enabled_agents=("codex",), bot_aliases=("codex-cvm",), default_agent="codex", strict_alias=True)
         self.assertEqual(r_codex.kind, "multi_agent")
         self.assertEqual(list(r_codex.agent_texts.keys()), ["codex"])
+        r_codebuddy = route_message("/all 看法", enabled_agents=("codebuddy",), bot_aliases=("codebuddy-cvm",), default_agent="codebuddy", strict_alias=True)
+        self.assertEqual(r_codebuddy.kind, "multi_agent")
+        self.assertEqual(list(r_codebuddy.agent_texts.keys()), ["codebuddy"])
 
     def test_shell_command_via_alias(self):
         route = route_message(

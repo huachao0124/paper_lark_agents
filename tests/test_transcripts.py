@@ -5,6 +5,7 @@ import unittest
 
 from paper_lark_agents.transcripts import (
     activity_detail,
+    activity_status,
     claude_effort_from_lines,
     claude_followup_from_lines,
     claude_reply_from_lines,
@@ -16,6 +17,7 @@ from paper_lark_agents.transcripts import (
     find_codex_rollout_by_id,
     read_new_jsonl,
     rollout_cwd,
+    turn_messages,
 )
 
 
@@ -324,6 +326,47 @@ class EffortParseTests(unittest.TestCase):
         self.assertIsNone(claude_effort_from_lines([
             {"type": "assistant", "message": {"model": "claude-opus-4-8", "stop_reason": "end_turn"}},
         ]))
+
+
+class TurnMessagesTests(unittest.TestCase):
+    @staticmethod
+    def _codex_msg(text):
+        return {"type": "event_msg", "payload": {"type": "agent_message", "message": text}}
+
+    def test_codex_collects_all_intermediate_messages(self):
+        lines = [
+            {"type": "event_msg", "payload": {"type": "task_started"}},
+            self._codex_msg("先查一下库存"),
+            {"type": "response_item", "payload": {"type": "function_call", "name": "exec_command"}},
+            self._codex_msg("发现问题，正在修复"),
+            self._codex_msg("修好了，正在验证"),
+        ]
+        self.assertEqual(
+            turn_messages(lines, "codex"),
+            ["先查一下库存", "发现问题，正在修复", "修好了，正在验证"],
+        )
+
+    def test_codex_skips_auto_review_json(self):
+        lines = [
+            self._codex_msg('{"outcome":"allow"}'),
+            self._codex_msg("真实回复"),
+            self._codex_msg('{"risk_level":"low","outcome":"allow","rationale":"x"}'),
+        ]
+        self.assertEqual(turn_messages(lines, "codex"), ["真实回复"])
+
+    def test_claude_collects_assistant_texts(self):
+        lines = [
+            _asst("第一段叙述", stop_reason=None),
+            _asst("最终回复"),
+        ]
+        self.assertEqual(turn_messages(lines, "claude"), ["第一段叙述", "最终回复"])
+
+    def test_codex_activity_status_line(self):
+        lines = [
+            {"type": "response_item", "payload": {"type": "function_call", "name": "exec_command", "arguments": '{"cmd":"ls"}'}},
+        ]
+        status = activity_status(lines, "codex")
+        self.assertIn("步", status)
 
 
 if __name__ == "__main__":

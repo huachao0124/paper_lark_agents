@@ -4,6 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import threading
@@ -37,7 +38,7 @@ from .prompts import (
     debate_session_turn_prompt,
     format_debate,
 )
-from .router import HELP_TEXT, Route, addressed_agents, route_message
+from .router import HELP_TEXT, Route, addressed_agent_sequence, addressed_agents, route_message
 from .status_card import turn_reply_card
 from .status_dashboard import StatusDashboardCard, StatusDashboardDoc, StatusDashboardStore
 from .turn_card import TurnCard, TurnCardManager
@@ -53,6 +54,9 @@ CHAT_DISBANDED_EVENT_TYPE = "im.chat.disbanded_v1"
 CHAT_CLOSED_EVENT_TYPES = {BOT_DELETED_EVENT_TYPE, CHAT_DISBANDED_EVENT_TYPE}
 FEISHU_LOCAL_TZ = timezone(timedelta(hours=8))
 DEBATE_BROADCAST_PREFIX = "Feishu command: /debate"
+HANDOFF_TARGET_AGENTS = {"codex", "claude", "codebuddy"}
+HANDOFF_SOURCE_AGENTS = {*HANDOFF_TARGET_AGENTS, "gpt-pro"}
+PENDING_RUN_RECENT_ACTIVITY_SECONDS = 10 * 60
 
 
 def parse_message_create_time(value: str) -> float | None:
@@ -169,7 +173,7 @@ class StatusHandle:
     def update(self, state: str, detail: str) -> None:
         if not self.message_id:
             return
-        if self.agent in {"codex", "claude"}:
+        if self.agent in {"codex", "claude", "codebuddy"}:
             detected_model = self.bridge.detect_session_model_label(self.chat_id, self.agent)
             if detected_model:
                 self.model = detected_model
@@ -228,6 +232,28 @@ class PaperAgentBridge:
         self._interactive_state_path = self.settings.state_dir / "interactive_prompts.json"
 
     def serve(self) -> None:
+        # Prevent duplicate bridge processes for the same agent — two processes
+        # competing for the same Feishu WebSocket cause event loss and phantom
+        # timeout cards. Use a pidfile lock; exit immediately if another
+        # instance is already running.
+        pidfile = self.settings.state_dir / f".bridge-{self.settings.agent_mode}.pid"
+        pidfile.parent.mkdir(parents=True, exist_ok=True)
+        if pidfile.exists():
+            try:
+                old_pid = int(pidfile.read_text().strip())
+                if old_pid > 0:
+                    try:
+                        os.kill(old_pid, 0)  # check if alive
+                        LOGGER.warning(
+                            "another %s bridge is already running (pid %d), exiting",
+                            self.settings.agent_mode, old_pid,
+                        )
+                        return
+                    except OSError:
+                        pass  # old process is dead, take over
+            except (ValueError, OSError):
+                pass
+        pidfile.write_text(str(os.getpid()))
         self._load_followup_cursors()
         self.pending_runs.compact()
         self.pending_runs.clear_stale_cards()
@@ -278,8 +304,9 @@ class PaperAgentBridge:
             self.lark.consume_events(self.handle_lark_event)
         except Exception:
             LOGGER.exception("event consumer died, process will exit")
-            import os
-            os._exit(1)
+            # Exit 0 (not 1) so wrapper scripts / background task managers
+            # don't interpret it as a retriable failure and respawn endlessly.
+            os._exit(0)
 
     def _load_chat_names(self) -> None:
         """Query Feishu for group names and register them with the session runtimes."""
@@ -294,13 +321,14 @@ class PaperAgentBridge:
             if chat_id and name:
                 self.agents.codex_session.set_chat_label(chat_id, name)
                 self.agents.claude_session.set_chat_label(chat_id, name)
+                self.agents.codebuddy_session.set_chat_label(chat_id, name)
                 if self.agents.gptpro_session:
                     self.agents.gptpro_session.set_chat_label(chat_id, name)
 
     def start_handoff_worker(self, stop_event: threading.Event) -> threading.Thread | None:
         if not self.settings.enable_agent_discussion or not self.settings.direct_agent_handoff:
             return None
-        if self.default_agent not in {"codex", "claude"}:
+        if self.default_agent not in HANDOFF_TARGET_AGENTS:
             return None
         worker = threading.Thread(
             target=self.handoff_loop,
@@ -324,7 +352,7 @@ class PaperAgentBridge:
         return worker
 
     def pending_run_agents(self) -> tuple[str, ...]:
-        if self.default_agent in {"codex", "claude", "gpt-pro"}:
+        if self.default_agent in {"codex", "claude", "gpt-pro", "codebuddy"}:
             return (self.default_agent,)
         return self.enabled_agents
 
@@ -357,41 +385,27 @@ class PaperAgentBridge:
             run.created_at,
             card_id=run.card_id,
         )
-        # Register the reconstructed card so acquire()/recovery see it and
-        # cannot spawn a duplicate for the same (agent, chat).
         return self.cards.adopt(card)
 
     def process_pending_run(self, run: PendingRun) -> None:
         if run.run_id in self._active_run_ids:
             return
         card = self._turn_card_from_run(run)
-        try:
-            reply = self.agents.find_session_reply(
-                run.agent,
-                run.chat_id,
-                run.start_marker,
-                run.end_marker,
-            )
-        except AgentError as exc:
-            LOGGER.warning("pending run %s recovery failed: %s", run.run_id, exc)
-            return
+        reply = self._find_pending_run_reply(run)
         if reply is None:
             # Check if the agent is still actively working — if so, keep
             # waiting regardless of age. Only expire if it's been idle too long.
             age = time.time() - run.created_at if run.created_at else 0
-            max_age = (run.timeout or self.agent_timeout(run.agent)) * 2
+            base_timeout = run.timeout or self.agent_timeout(run.agent)
+            max_age = base_timeout * 2
+            # Absolute ceiling: even if the transcript keeps growing (a wedged
+            # CLI that loops without ever emitting the end marker), give up so
+            # the card doesn't sit "Running" forever. 24h for long-running
+            # /loop tasks that legitimately run for hours.
+            hard_max_age = max(base_timeout * 8, 86400)
             if age > max_age:
-                still_busy = False
-                try:
-                    runtime = self.agents.runtime_for(run.agent)
-                    session_name = runtime.session_name(run.chat_id)
-                    if runtime.session_exists(session_name):
-                        screen = runtime.capture(session_name)
-                        from .tmux_runtime import session_tail_busy
-                        still_busy = session_tail_busy(screen)
-                except Exception:
-                    pass
-                if not still_busy:
+                active_reason = None if age > hard_max_age else self.pending_run_active_reason(run)
+                if not active_reason:
                     if not card:
                         card = self.cards.active_for(run.agent, run.chat_id)
                     if card:
@@ -407,6 +421,11 @@ class PaperAgentBridge:
                     self.pending_runs.mark_done(run.run_id, status="timeout")
                     LOGGER.info("pending run %s timed out after %.0fs (agent idle)", run.run_id, age)
                     return
+                LOGGER.debug(
+                    "pending run %s is over soft timeout but still active: %s",
+                    run.run_id,
+                    active_reason,
+                )
             if not card and self.settings.send_progress:
                 # Use a plain card (not streaming) for pending run progress —
                 # streaming cards time out after 10 min, but agents can run for hours.
@@ -455,6 +474,91 @@ class PaperAgentBridge:
         finally:
             self.pending_runs.mark_done(run.run_id)
 
+    def _find_pending_run_reply(self, run: PendingRun) -> str | None:
+        """Read reply from the JSONL transcript, only considering entries
+        written after this run was created."""
+        try:
+            runtime = self.agents.runtime_for(run.agent)
+            session_name = runtime.session_name(run.chat_id)
+            workspace = self.chat_workspace(run.chat_id)
+            path = runtime.resolve_transcript_path(session_name, run.chat_id, workspace)
+            if not path or not path.exists():
+                return None
+            from .transcripts import read_new_jsonl
+            size = path.stat().st_size
+            lines, _ = read_new_jsonl(path, max(0, size - 200000))
+            # Only consider entries after this run was created
+            min_ts = run.created_at or 0
+            recent = [
+                o for o in lines
+                if _jsonl_timestamp(o) >= min_ts - 5
+            ]
+            result = runtime.parse_transcript_reply(recent)
+            return result.text if result is not None else None
+        except Exception:
+            return None
+
+    def pending_run_active_reason(self, run: PendingRun) -> str | None:
+        """Return why an over-age pending run should keep waiting.
+
+        The CLI screen can look idle while the native transcript is still being
+        appended. Treat recent transcript growth as activity so long context
+        turns do not get marked failed while they are still streaming.
+        """
+        try:
+            runtime = self.agents.runtime_for(run.agent)
+            session_name = runtime.session_name(run.chat_id)
+            if runtime.session_exists(session_name):
+                screen = runtime.capture(session_name)
+                from .tmux_runtime import session_has_background_work, session_tail_busy
+                if session_tail_busy(screen):
+                    return "screen busy"
+                if session_has_background_work(screen):
+                    return "background work"
+            transcript_reason = self.pending_run_recent_transcript_activity(
+                run,
+                runtime,
+                session_name,
+            )
+            if transcript_reason:
+                return transcript_reason
+        except Exception:
+            # A transient tmux/subprocess error here must NOT be read as "agent
+            # is idle" — that would falsely time out a still-running turn. Keep
+            # the run alive one more poll cycle instead.
+            return "active check errored"
+        return None
+
+    def pending_run_recent_transcript_activity(
+        self,
+        run: PendingRun,
+        runtime: Any,
+        session_name: str,
+    ) -> str | None:
+        try:
+            cursor = runtime.read_run_cursor(session_name, run.run_id)
+        except Exception:
+            return None
+        if not cursor:
+            return None
+        path_str, offset = cursor
+        if not path_str:
+            return None
+        try:
+            stat = Path(path_str).stat()
+        except OSError:
+            return None
+        try:
+            start_offset = max(0, int(offset))
+        except (TypeError, ValueError):
+            start_offset = 0
+        if stat.st_size <= start_offset:
+            return None
+        idle_seconds = time.time() - stat.st_mtime
+        if idle_seconds <= PENDING_RUN_RECENT_ACTIVITY_SECONDS:
+            return f"transcript updated {max(0, int(idle_seconds))}s ago"
+        return None
+
     def pending_run_expired(self, run: PendingRun) -> bool:
         timeout = run.timeout or self.agent_timeout(run.agent)
         return time.time() > run.created_at + max(1, timeout)
@@ -462,46 +566,33 @@ class PaperAgentBridge:
     def update_recovered_status(self, run: PendingRun, card: TurnCard | None) -> None:
         if not card:
             return
-        # Prefer the live card tracked by the manager.
         cached = self.cards.active_for(card.agent, card.chat_id)
         if cached and cached.message_id:
             card = cached
-        if not card.message_id:
-            return
         interval = max(1, self.settings.status_update_seconds)
         last = self._pending_status_updates.get(run.run_id, 0.0)
         if time.time() - last < interval:
             return
-        detail = None
+        detail = "仍在处理,完成后这张卡会更新成回复…"
         try:
             runtime = self.agents.runtime_for(run.agent)
             session_name = runtime.session_name(run.chat_id)
-            transcript_path = (runtime.read_metadata(session_name) or {}).get("transcript_path")
-            if transcript_path and Path(transcript_path).exists():
+            workspace = self.chat_workspace(run.chat_id)
+            path = runtime.resolve_transcript_path(session_name, run.chat_id, workspace)
+            if path and path.exists():
                 from .transcripts import activity_detail, read_new_jsonl
-                recent_lines, _ = read_new_jsonl(Path(transcript_path), max(0, Path(transcript_path).stat().st_size - 50000))
-                detail = activity_detail(recent_lines, run.agent)
+                size = path.stat().st_size
+                lines, _ = read_new_jsonl(path, max(0, size - 200000))
+                min_ts = run.created_at or 0
+                recent = [o for o in lines if _jsonl_timestamp(o) >= min_ts - 5]
+                if recent:
+                    detail = activity_detail(recent, run.agent)
         except Exception:
             pass
-        if not detail:
-            detail = self.agents.session_progress(run.agent, run.chat_id) or "仍在处理,完成后这张卡会更新成回复…"
-        # Check tmux screen for errors and interactive prompts.
         try:
             runtime = self.agents.runtime_for(run.agent)
             session_name = runtime.session_name(run.chat_id)
             screen = runtime.capture(session_name)
-            error = _detect_screen_error(screen)
-            if error:
-                detail = f"⚠️ {error}\n\n{detail}"
-                error_key = f"{run.agent}:{run.chat_id}:screen_error"
-                last = self._pending_status_updates.get(error_key)
-                if not last or time.time() - last > 120:
-                    self._pending_status_updates[error_key] = time.time()
-                    self.send_progress_markdown(
-                        run.chat_id,
-                        f"⚠️ **{self.agent_display_name(run.agent)}** 遇到错误:\n`{error}`\n\n"
-                        f"请换个措辞重试,或发 `/clear` 重置会话。",
-                    )
             self._check_interactive_prompt(run.agent, run.chat_id, session_name, screen)
         except Exception:
             pass
@@ -708,9 +799,19 @@ class PaperAgentBridge:
             self.lark.send_markdown(event.chat_id, f"Task parse error: {exc}")
             return
 
+        if source_agent is None:
+            self.update_responder_from_human_mentions(event)
+
         if route.kind == "ignore":
             return
-        if route.kind in {"workspace", "clear", "responder"} and not self.settings.handle_management_commands:
+        if (
+            route.kind in {"workspace", "clear", "responder"}
+            and not self.settings.handle_management_commands
+            and not route.addressed
+        ):
+            # Bare management commands belong to the managing bot; but a
+            # command explicitly @-addressed to THIS bot is handled here, so
+            # groups without the managing bot can still run /workspace.
             return
         if route.kind == "task" and not self.settings.enable_tasks:
             return
@@ -725,12 +826,15 @@ class PaperAgentBridge:
                 return
             route = gated
         LOGGER.info("handling %s from %s (text=%r)", route.kind, event.sender_id, (route.text or event.content)[:120])
+        # append_user before dispatch so build_agent_prompt can include it.
+        if self.settings.enable_memory and route.kind not in {"workspace", "clear", "responder", "session_command", "shell_command"}:
+            self.memory.append_user(event, route.text or event.content)
         try:
             reply = self.dispatch(route, event, source_agent=source_agent)
         except (AgentError, LarkCLIError) as exc:
             reply = f"Bridge error: {exc}"
         if self.settings.enable_memory and route.kind not in {"workspace", "clear", "responder", "session_command", "shell_command"}:
-            self.memory.append_user(event, route.text or event.content)
+            self.mark_route_seen(route, event)
         if reply and not self.is_no_reply(reply):
             self.send_reply(event, route, reply, source_agent=source_agent)
             if self.settings.enable_memory:
@@ -744,13 +848,15 @@ class PaperAgentBridge:
             return ("claude",)
         if self.settings.agent_mode == "gpt-pro":
             return ("gpt-pro",)
+        if self.settings.agent_mode == "codebuddy":
+            return ("codebuddy",)
         if self.settings.agent_mode == "tasks":
             return ()
         return ("codex", "claude")
 
     @property
     def default_agent(self) -> str | None:
-        if self.settings.agent_mode in {"codex", "claude", "gpt-pro"}:
+        if self.settings.agent_mode in {"codex", "claude", "gpt-pro", "codebuddy"}:
             return self.settings.agent_mode
         return None
 
@@ -820,7 +926,8 @@ class PaperAgentBridge:
         reply = format_standalone_upload_reply(downloaded)
         self.send_progress_markdown(event.chat_id, reply)
         if self.settings.enable_memory:
-            self.memory.append_assistant(event.chat_id, "bridge", reply)
+            file_context = "\n".join(f"{name}: {path}" for name, path in downloaded)
+            self.memory.append_user(event, f"[上传文件]\n{file_context}")
 
     def prepare_event(self, event: MessageEvent) -> MessageEvent:
         if event.message_type not in RESOURCE_MESSAGE_TYPES:
@@ -831,30 +938,14 @@ class PaperAgentBridge:
         if not resources:
             if event.message_type == "post":
                 return event
-            return replace(
-                event,
-                content=(
-                    f"User sent a {event.message_type} message, but the bridge could not "
-                    f"extract a downloadable resource key.\nRaw content: {event.content}"
-                ),
-            )
+            return event
         downloaded = self.download_inbound_resources(event)
         lines: list[str] = []
         if event.message_type == "post" and event.content.strip():
             lines.append(event.content.strip())
             lines.append("")
-        lines.extend([
-            f"User uploaded/embedded {len(downloaded)} attachment(s) to the Feishu group.",
-            "Downloaded local paths:",
-        ])
         for name, path in downloaded:
-            lines.append(f"- {name}: {path}")
-        lines.extend(
-            [
-                "",
-                "Use these local paths directly when reading or analyzing the uploaded files.",
-            ]
-        )
+            lines.append(f"{name}: {path}")
         return replace(event, content="\n".join(lines))
 
     def download_inbound_resources(self, event: MessageEvent) -> list[tuple[str, Path]]:
@@ -902,6 +993,8 @@ class PaperAgentBridge:
             return self.handle_responder_command(event.chat_id, route.text)
         if route.kind == "import_memory":
             return self.handle_import_memory(event.chat_id, route.text)
+        if route.kind == "memory_config":
+            return self.handle_memory_config(event.chat_id, route.text)
         if route.kind == "session_command":
             assert route.agent is not None
             return self.handle_session_command(route.agent, event.chat_id, route.text)
@@ -950,6 +1043,38 @@ class PaperAgentBridge:
             workspace = self.chat_workspace(event.chat_id)
             effort = self.chat_effort(event.chat_id, route.agent)
             model = self.chat_model_override(event.chat_id, route.agent)
+            # Mid-turn message: a run is already in flight for this session.
+            # Steer the message into the running turn instead of spawning a
+            # second poller — codex merges it into the current turn (one
+            # task_complete covers both); claude queues it as the next turn
+            # (followup_loop delivers the extra reply). The old card settles
+            # with its accumulated content; a fresh card below this message
+            # receives everything from here on (the existing poller resolves
+            # the active card dynamically).
+            if (
+                self.agent_runtime(route.agent) == "session"
+                and self.pending_runs.has_chat_run(event.chat_id, route.agent)
+            ):
+                steer_prompt, _ = self.build_agent_prompt(
+                    route.agent, event, route.text, source_agent, workspace,
+                )
+                if self.settings.send_progress:
+                    self.cards.acquire(
+                        event.chat_id,
+                        route.agent,
+                        self.agent_display_name(route.agent),
+                        self.chat_model_label(event.chat_id, route.agent),
+                        self.chat_effort_label(event.chat_id, route.agent),
+                        force=True,
+                    )
+                runtime = self.agents.runtime_for(route.agent)
+                session_name = runtime.session_name(event.chat_id)
+                runtime.paste_and_submit(session_name, steer_prompt)
+                LOGGER.info(
+                    "steered message into active %s run in %s",
+                    route.agent, event.chat_id,
+                )
+                return ""
             turn_card = None
             if self.settings.send_progress:
                 turn_card = self.cards.acquire(
@@ -996,19 +1121,26 @@ class PaperAgentBridge:
                     timeout=self.agent_timeout(route.agent),
                 )
             try:
-                def _progress(detail: str, _agent=route.agent, _chat=event.chat_id) -> None:
-                    if turn_card:
-                        turn_card.model = self.chat_model_label(_chat, _agent)
-                        turn_card.effort = self.chat_effort_label(_chat, _agent)
-                        self.cards.update(turn_card, detail)
-                    if _agent == "gpt-pro":
-                        runtime = self.agents.gptpro_session
-                    elif _agent == "codex":
-                        runtime = self.agents.codex_session
-                    else:
-                        runtime = self.agents.claude_session
-                    if runtime is None:
+                def _progress(payload, _agent=route.agent, _chat=event.chat_id) -> None:
+                    # Resolve the CURRENT active card each tick — a mid-turn
+                    # message (steer) settles the old card and puts a fresh one
+                    # below the new question; content must flow into that one.
+                    card = self.cards.active_for(_agent, _chat) or turn_card
+                    if card:
+                        card.model = self.chat_model_label(_chat, _agent)
+                        card.effort = self.chat_effort_label(_chat, _agent)
+                        if isinstance(payload, dict):
+                            for msg in payload.get("messages", []):
+                                self.cards.update_with_reply(card, msg)
+                            status = payload.get("status") or ""
+                            if status:
+                                self.cards.update(card, status)
+                        else:
+                            # Legacy string payload (gpt-pro runtime).
+                            self.cards.update(card, str(payload))
+                    if self.agent_runtime(_agent) != "session":
                         return
+                    runtime = self.agents.runtime_for(_agent)
                     try:
                         sn = runtime.session_name(_chat)
                         screen = runtime.capture(sn)
@@ -1029,6 +1161,17 @@ class PaperAgentBridge:
                     )
                 elif route.agent == "codex":
                     result = self.agents.run_codex(
+                        prompt,
+                        event.chat_id,
+                        session_context=session_context,
+                        workspace=workspace,
+                        model=model,
+                        effort=effort,
+                        progress_callback=_progress,
+                        run_id=run_id,
+                    )
+                elif route.agent == "codebuddy":
+                    result = self.agents.run_codebuddy(
                         prompt,
                         event.chat_id,
                         session_context=session_context,
@@ -1067,11 +1210,14 @@ class PaperAgentBridge:
             if run_id:
                 self.pending_runs.mark_done(run_id)
                 self._active_run_ids.discard(run_id)
-            if turn_card:
+            # Resolve the current active card — a mid-turn steer may have
+            # replaced this dispatch's original card with a fresh one.
+            final_card = self.cards.active_for(route.agent, event.chat_id) or turn_card
+            if final_card:
                 # The progress card morphs into the reply (or "no reply"); the
                 # bridge delivers it here, so handle_event must not send it again.
                 self.finalize_turn_reply(
-                    turn_card,
+                    final_card,
                     route,
                     event,
                     text,
@@ -1502,7 +1648,7 @@ class PaperAgentBridge:
         # Commands that produce output (like /deep-research) need a card +
         # JSONL monitoring, just like a normal agent turn. Settings-only
         # commands (/effort, /model) are handled before reaching here.
-        if self.settings.send_progress and self.agent_runtime(agent) == "session":
+        if self.settings.send_progress and self.agent_runtime(agent) == "session" and agent != "codebuddy":
             return self._watch_session_command_reply(agent, chat_id, workspace, preview)
         return f"已发送到 {agent_name} 会话：`{preview}`"
 
@@ -1599,7 +1745,8 @@ class PaperAgentBridge:
         reset: list[str] = []
         failed: list[str] = []
         cli_files_deleted = 0
-        for agent in ("codex", "claude"):
+        cleanup_agents = dict.fromkeys((*self.workspace_warmup_agents(), *self.enabled_agents))
+        for agent in cleanup_agents:
             if self.agent_runtime(agent) != "session":
                 continue
             try:
@@ -1687,6 +1834,31 @@ class PaperAgentBridge:
             return route
         return route
 
+    def update_responder_from_human_mentions(self, event: MessageEvent) -> None:
+        mentions = addressed_agent_sequence(event.content)
+        if not mentions:
+            return
+        responder = mentions[-1]
+        # Only switch the default responder to an agent that is DEPLOYED
+        # somewhere in this system. Otherwise an @-mention of an agent that
+        # isn't deployed anywhere (e.g. @CodeBuddy in a codex+claude-only
+        # deployment) would point the shared responder at a phantom and silence
+        # every real bot for unaddressed messages. This still switches to a peer
+        # this process doesn't itself serve (e.g. the claude process recording
+        # responder=codex so it stays quiet) — that cross-process coordination
+        # is intentional.
+        if responder not in self.settings.deployed_agents:
+            return
+        try:
+            self.responders.set(event.chat_id, responder)
+        except ResponderError:
+            return
+        LOGGER.info(
+            "default responder for %s switched to %s by latest human @mention",
+            event.chat_id,
+            responder,
+        )
+
     def handle_import_memory(self, chat_id: str, text: str) -> str:
         """Import room memory from another chat_id into the current chat.
 
@@ -1726,7 +1898,7 @@ class PaperAgentBridge:
         try:
             responder = self.responders.set(chat_id, command)
         except ResponderError as exc:
-            return f"{exc}\n\nUsage: `/responder [codex|claude|both|reset]`"
+            return f"{exc}\n\nUsage: `/responder [codex|claude|codebuddy|both|reset]`"
         return (
             f"Default responder for this group set to: **{self.responder_label(responder)}**.\n\n"
             f"{self.responder_help_note()}"
@@ -1751,9 +1923,22 @@ class PaperAgentBridge:
             "Unaddressed group messages are answered only by the default responder. "
             "@-mention a bot to reach it directly; this setting does not affect "
             "@-mentions or bot-to-bot discussion.\n"
-            "Switch with `/responder codex`, `/responder claude`, `/responder both`, "
+            "Switch with `/responder codex`, `/responder claude`, `/responder codebuddy`, `/responder both`, "
             "or `/responder reset`."
         )
+
+    def handle_memory_config(self, chat_id: str, text: str) -> str:
+        arg = text.strip()
+        if not arg or arg.lower() in {"show", "status"}:
+            return f"当前上下文条数: **{self.memory.max_turns}**\n\n`/memory <N>` 修改"
+        try:
+            n = int(arg)
+        except ValueError:
+            return f"请输入数字，例如 `/memory 10`"
+        if n < 1:
+            return "至少 1 条"
+        self.memory.max_turns = n
+        return f"上下文条数已设为 **{n}**"
 
     def handle_workspace_command(self, chat_id: str, text: str) -> str:
         command = text.strip()
@@ -1984,11 +2169,24 @@ class PaperAgentBridge:
             return ""
         # On a peer handoff the peer's message is delivered separately as the
         # turn content; if room memory already recorded it as the last turn,
-        # drop it so it isn't shown twice. (Human turns aren't in memory yet.)
+        # drop it so it isn't shown twice. Exact endswith fails on whitespace/
+        # truncation differences, so locate the peer's last entry and compare
+        # normalized prefixes. Loop: history may contain the same reply twice
+        # (double-append from two bridge processes).
         if source_agent:
-            tail = f"{source_agent}: {text}".strip()
-            if recap.endswith(tail):
-                recap = recap[: -len(tail)].rstrip()
+            marker = f"{source_agent}: "
+            b = "".join(text.split())[:80]
+            for _ in range(3):
+                idx = recap.rfind(f"\n\n{marker}")
+                start = idx + 2 if idx >= 0 else (0 if recap.startswith(marker) else -1)
+                if start < 0:
+                    break
+                entry = recap[start + len(marker):]
+                a = "".join(entry.split())[:80]
+                if a and b and (a.startswith(b[:40]) or b.startswith(a[:40])):
+                    recap = recap[:start].rstrip()
+                else:
+                    break
         return recap
 
     def build_debate_prompt(
@@ -2009,6 +2207,8 @@ class PaperAgentBridge:
     def agent_runtime(self, agent: str) -> str:
         if agent == "codex":
             return self.settings.codex_runtime
+        if agent == "codebuddy":
+            return self.settings.codebuddy_runtime
         if agent == "gpt-pro":
             # gpt-pro runs as a codex session when PLA_GPT_PRO_RUNTIME=codex.
             return "session" if self.settings.gpt_pro_runtime == "codex" else "api"
@@ -2022,9 +2222,11 @@ class PaperAgentBridge:
         workspace: Path,
     ) -> str:
         if agent == "gpt-pro":
-            agent_name, peer_name = "GPT-Pro", "Codex 和 Claude"
+            agent_name, peer_name = "GPT-Pro", ""
         elif agent == "codex":
             agent_name, peer_name = "Codex", "Claude"
+        elif agent == "codebuddy":
+            agent_name, peer_name = "CodeBuddy", ""
         else:
             agent_name, peer_name = "Claude Code", "Codex"
         return agent_session_context_prompt(
@@ -2059,6 +2261,8 @@ class PaperAgentBridge:
             return self.settings.codex_default_effort
         if agent == "claude":
             return self.settings.claude_default_effort
+        if agent == "codebuddy":
+            return self.settings.codebuddy_default_effort
         return None
 
     def agent_timeout(self, agent: str) -> int:
@@ -2066,6 +2270,8 @@ class PaperAgentBridge:
             return self.settings.codex_timeout
         if agent == "claude":
             return self.settings.claude_timeout
+        if agent == "codebuddy":
+            return self.settings.codebuddy_timeout
         return max(self.settings.codex_timeout, self.settings.claude_timeout)
 
     def chat_model(self, chat_id: str, agent: str) -> str | None:
@@ -2103,6 +2309,8 @@ class PaperAgentBridge:
             return self.settings.codex_model
         if agent == "claude":
             return self.settings.claude_model
+        if agent == "codebuddy":
+            return self.settings.codebuddy_model
         return None
 
     def agent_display_name(self, agent: str) -> str:
@@ -2112,6 +2320,8 @@ class PaperAgentBridge:
             return "Claude"
         if agent == "gpt-pro":
             return "GPT-Pro"
+        if agent == "codebuddy":
+            return "CodeBuddy"
         return agent
 
     def room_memory(self, chat_id: str) -> str:
@@ -2131,6 +2341,27 @@ class PaperAgentBridge:
         if route.kind == "session_command":
             return route.agent or "bridge"
         return "bridge"
+
+    def mark_route_seen(self, route: Route, event: MessageEvent) -> None:
+        for agent in self.seen_agents_for_route(route):
+            self.memory.mark_agent_seen(
+                event.chat_id,
+                agent,
+                message_id=event.message_id,
+                event_id=event.event_id,
+            )
+
+    def seen_agents_for_route(self, route: Route) -> tuple[str, ...]:
+        if route.kind == "agent" and route.agent and route.text:
+            return (route.agent,)
+        if route.kind == "multi_agent" and route.agent_texts:
+            return tuple(agent for agent, text in route.agent_texts.items() if text)
+        if route.kind == "debate" and route.text:
+            # Debate dispatch only runs codex+claude; those are the agents that
+            # "produced" the turn. codebuddy (if enabled) did not run the debate
+            # and should still see it as new context, so it is not listed here.
+            return ("codex", "claude")
+        return ()
 
     def send_bridge_markdown(
         self,
@@ -2579,22 +2810,23 @@ class PaperAgentBridge:
                 LOGGER.info("follow-up reply from %s in %s", agent, event.chat_id)
                 delivered = False
                 if self.settings.send_progress:
-                    agent_name = self.agent_display_name(agent)
-                    limit = self.settings.max_message_chars
-                    body = text if len(text) <= limit else text[:limit].rstrip() + "\n\n…（下接）"
-                    # Prefer finalizing the existing Running card → Done
-                    # instead of creating a new card (which leaves the Running
-                    # card orphaned on screen).
+                    # Follow-up content goes INTO the existing Running card
+                    # (same turn, same card). The card stays Running — only
+                    # dispatch's finalize_turn_reply turns it Done when the
+                    # full turn ends. This keeps everything in one card.
+                    CARD_LIMIT = 12000
                     active = self.cards.active_for(agent, event.chat_id)
                     if active:
-                        if self.cards.finalize(active, "done", body):
-                            delivered = True
-                            LOGGER.info("follow-up finalized Running card for %s in %s", agent, event.chat_id)
+                        self.cards.update_with_reply(active, text[:CARD_LIMIT])
+                        delivered = True
+                        LOGGER.info("follow-up updated Running card for %s in %s", agent, event.chat_id)
                     if not delivered:
-                        # No active Running card — this is a supplementary
-                        # follow-up after the main reply was already delivered.
-                        # Send as plain markdown instead of a new Done card to
-                        # avoid card clutter.
+                        # No active Running card — the turn already finished
+                        # (dispatch finalized it). Append to the Done card.
+                        if self.cards.append_follow_up(agent, event.chat_id, text):
+                            delivered = True
+                            LOGGER.info("follow-up appended to card for %s in %s", agent, event.chat_id)
+                    if not delivered:
                         try:
                             self.send_bridge_markdown(
                                 event.chat_id, text, agent=agent, discussion_trigger=False,
@@ -2624,7 +2856,7 @@ class PaperAgentBridge:
                     self.memory.append_assistant(event.chat_id, agent, text)
                 if self.should_enqueue_teammate_handoff(route, text, depth):
                     self.enqueue_teammate_handoff(
-                        event, source_agent=agent, reply=text,
+                        event, route, source_agent=agent, reply=text,
                         inbound_source_agent=source_agent, handoff_depth=depth,
                     )
             # Checkpoint advanced offsets so a restart resumes from the right
@@ -2672,6 +2904,7 @@ class PaperAgentBridge:
         if self.should_enqueue_teammate_handoff(route, text, handoff_depth):
             self.enqueue_teammate_handoff(
                 event,
+                route,
                 source_agent=route.agent,  # type: ignore[arg-type]
                 reply=text,
                 inbound_source_agent=source_agent,
@@ -2842,6 +3075,7 @@ class PaperAgentBridge:
         if self.should_enqueue_teammate_handoff(route, reply, handoff_depth):
             self.enqueue_teammate_handoff(
                 event,
+                route,
                 source_agent=route.agent,  # type: ignore[arg-type]
                 reply=reply,
                 inbound_source_agent=source_agent,
@@ -2851,21 +3085,41 @@ class PaperAgentBridge:
     def should_enqueue_teammate_handoff(
         self, route: Route, reply: str, handoff_depth: int
     ) -> bool:
+        return bool(self.handoff_targets_for_reply(route, reply, handoff_depth))
+
+    def handoff_targets_for_reply(
+        self,
+        route: Route,
+        reply: str,
+        handoff_depth: int,
+        inbound_source_agent: str | None = None,
+    ) -> tuple[str, ...]:
         if route.kind != "agent" or not route.agent:
-            return False
-        # /debate seeds the first exchange even if the opener doesn't address the peer.
+            return ()
+        source_agent = route.agent
+        if source_agent not in HANDOFF_SOURCE_AGENTS:
+            return ()
+        # /debate keeps its historical Codex<->Claude seed behavior even if the
+        # opener does not explicitly @ the peer.
         if handoff_depth == 0 and route.text.lstrip().startswith(DEBATE_BROADCAST_PREFIX):
-            return True
-        # Otherwise a bot hands the thread to its teammate only by explicitly
-        # @-addressing it in the reply. The exchange self-limits: it continues
-        # only while they keep @-ing each other, and the depth/window caps in
-        # enqueue_teammate_handoff are the hard backstop.
-        peer = "claude" if route.agent == "codex" else "codex"
-        return peer in addressed_agents(reply)
+            mentioned = {"claude"} if source_agent == "codex" else {"codex"} if source_agent == "claude" else set()
+        else:
+            # Otherwise a bot hands the thread to teammates only by explicitly
+            # @-addressing them in the reply. The exchange self-limits: it
+            # continues only while they keep @-ing each other, and the
+            # depth/window caps in enqueue_teammate_handoff are the hard
+            # backstop.
+            mentioned = addressed_agents(reply) & HANDOFF_TARGET_AGENTS
+        return tuple(
+            target
+            for target in sorted(mentioned)
+            if target != source_agent
+        )
 
     def enqueue_teammate_handoff(
         self,
         event: MessageEvent,
+        route: Route,
         *,
         source_agent: str,
         reply: str,
@@ -2874,49 +3128,64 @@ class PaperAgentBridge:
     ) -> None:
         if not self.settings.enable_agent_discussion or not self.settings.direct_agent_handoff:
             return
-        if source_agent not in {"codex", "claude"}:
+        if source_agent not in HANDOFF_SOURCE_AGENTS:
             return
         if inbound_source_agent == source_agent:
             return
-        # Dedup: multiple code paths (finalize_turn_reply, followup_loop,
-        # send_reply) can try to enqueue the same reply as a handoff.
-        sig = f"{source_agent}:{event.chat_id}:{reply[:200]}"
-        with self._recent_handoff_sigs_lock:
-            if sig in self._recent_handoff_sigs:
-                return
-            self._recent_handoff_sigs.add(sig)
-            # Keep the set bounded.
-            if len(self._recent_handoff_sigs) > 200:
-                self._recent_handoff_sigs = set(list(self._recent_handoff_sigs)[-100:])
+        targets = self.handoff_targets_for_reply(
+            route,
+            reply,
+            handoff_depth,
+            inbound_source_agent=inbound_source_agent,
+        )
+        if not targets:
+            return
         next_depth = handoff_depth + 1
         if next_depth > max(0, self.settings.max_agent_discussion_turns):
             LOGGER.info("skipping handoff from %s; discussion depth cap reached", source_agent)
             return
+        # Read the window count once; track locally as we enqueue so we don't
+        # re-read the store per target on this hot bot-to-bot path.
+        cap = max(0, self.settings.max_agent_discussion_turns)
         recent = self.handoffs.recent_count(
             event.chat_id,
             self.settings.agent_discussion_window_seconds,
         )
-        if recent >= self.settings.max_agent_discussion_turns:
-            LOGGER.info("skipping handoff from %s; discussion window cap reached", source_agent)
-            return
-        target_agent = "claude" if source_agent == "codex" else "codex"
-        handoff_id = self.handoffs.enqueue(
-            event.chat_id,
-            source_agent=source_agent,
-            target_agent=target_agent,
-            content=reply,
-            origin_event_id=event.event_id,
-            origin_message_id=event.message_id,
-            sender_id=event.sender_id,
-            depth=next_depth,
-        )
-        LOGGER.info(
-            "queued handoff %s from %s to %s in %s",
-            handoff_id,
-            source_agent,
-            target_agent,
-            event.chat_id,
-        )
+        enqueued = 0
+        for target_agent in targets:
+            if recent + enqueued >= cap:
+                LOGGER.info("skipping handoff from %s; discussion window cap reached", source_agent)
+                break
+            # Per-TARGET dedup: multiple code paths (finalize_turn_reply,
+            # followup_loop, send_reply) can re-enqueue the same reply. Keying
+            # the sig on the target (not just the reply) means one target's
+            # success — or being skipped by the cap — never suppresses another,
+            # and a target dropped by the cap stays retryable.
+            sig = f"{source_agent}:{event.chat_id}:{target_agent}:{reply[:200]}"
+            with self._recent_handoff_sigs_lock:
+                if sig in self._recent_handoff_sigs:
+                    continue
+                self._recent_handoff_sigs.add(sig)
+                if len(self._recent_handoff_sigs) > 200:
+                    self._recent_handoff_sigs = set(list(self._recent_handoff_sigs)[-100:])
+            handoff_id = self.handoffs.enqueue(
+                event.chat_id,
+                source_agent=source_agent,
+                target_agent=target_agent,
+                content=reply,
+                origin_event_id=event.event_id,
+                origin_message_id=event.message_id,
+                sender_id=event.sender_id,
+                depth=next_depth,
+            )
+            enqueued += 1
+            LOGGER.info(
+                "queued handoff %s from %s to %s in %s",
+                handoff_id,
+                source_agent,
+                target_agent,
+                event.chat_id,
+            )
 
     def relay_artifacts(self, chat_id: str, markdown: str, workspace: Path) -> None:
         if not self.settings.enable_artifacts or self.settings.max_artifacts <= 0:
@@ -2996,7 +3265,8 @@ def _is_interactive_reply(text: str) -> str | None:
 _SCREEN_ERROR_PATTERNS = [
     "at capacity",
     "rate limit",
-    "429",
+    "429 Too Many",
+    "Error code: 429",
     "500 Internal Server Error",
     "502 Bad Gateway",
     "503 Service Unavailable",
@@ -3007,6 +3277,21 @@ _SCREEN_ERROR_PATTERNS = [
     "Usage Policy",
     "unable to respond",
 ]
+
+
+def _jsonl_timestamp(entry: dict) -> float:
+    """Extract a unix timestamp from a JSONL entry."""
+    ts = entry.get("timestamp") or ""
+    if isinstance(ts, (int, float)):
+        return float(ts)
+    if isinstance(ts, str) and ts:
+        try:
+            from datetime import datetime, timezone
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            return dt.timestamp()
+        except (ValueError, OSError):
+            pass
+    return 0.0
 
 
 def _detect_screen_error(screen: str) -> str | None:
@@ -3021,17 +3306,7 @@ def _detect_screen_error(screen: str) -> str | None:
 
 
 def format_standalone_upload_reply(downloaded: list[tuple[str, Path]]) -> str:
-    lines = [
-        "文件已保存到服务器，本次不会转发给 Codex/Claude。",
-        "",
-        "本地路径：",
-    ]
+    lines = ["文件已保存:"]
     for name, path in downloaded:
-        lines.append(f"- {name}: `{path}`")
-    lines.extend(
-        [
-            "",
-            "之后可以直接引用这个文件，或把上面的路径发给指定助手。",
-        ]
-    )
+        lines.append(f"- `{name}` → `{path}`")
     return "\n".join(lines)

@@ -22,9 +22,16 @@ from .transcripts import (
     claude_activity,
     codex_activity,
     claude_followup_from_lines,
+    codebuddy_activity,
+    codebuddy_effort_from_lines,
+    codebuddy_model_from_lines,
+    codebuddy_reply_from_lines,
     claude_reply_from_lines,
     codex_reply_from_lines,
+    encode_codebuddy_project_dir,
     encode_claude_project_dir,
+    find_codebuddy_recent_session_file,
+    find_codebuddy_session_file,
     find_claude_recent_session_file,
     find_claude_session_file,
     find_codex_rollout,
@@ -41,6 +48,12 @@ LOGGER = logging.getLogger(__name__)
 
 SESSION_PROMPT_VERSION = 10
 EFFORT_TOKEN_PATTERN = r"[A-Za-z][A-Za-z0-9_-]*"
+CODEBUDDY_REPLY_QUIET_SECONDS = 2.0
+CODEX_PASTE_SETTLE_SECONDS = 2.0
+CLAUDE_PASTE_SETTLE_SECONDS = 0.5
+CODEBUDDY_PASTE_SETTLE_SECONDS = 1.2
+CODEBUDDY_SUBMIT_RETRY_DELAY_SECONDS = 1.0
+CODEBUDDY_SUBMIT_RETRIES = 3
 
 
 class TmuxRuntimeError(RuntimeError):
@@ -105,8 +118,6 @@ class TmuxSessionRuntime:
         self.apply_effort_if_needed(session_name, effort)
         marker = run_id or uuid.uuid4().hex
         start_marker, end_marker = self.reply_markers(marker)
-        # Snapshot the session transcript before submitting so we only read the
-        # reply to *this* prompt; persist the cursor by run id for recovery.
         path_str, offset = self.transcript_cursor(session_name, chat_id, workspace)
         self.store_run_cursor(session_name, marker, path_str, offset)
         wrapped = self.wrap_prompt(
@@ -262,8 +273,8 @@ class TmuxSessionRuntime:
         prior_uuid = prior_meta.get("session_uuid")
         resume_uuid = None
         if isinstance(prior_uuid, str) and prior_uuid.strip():
-            if self.agent == "codex":
-                # codex resume always works — -C is stripped, tmux -c sets cwd.
+            if self.agent in {"codex", "codebuddy"}:
+                # Codex/CodeBuddy resume by explicit id; tmux -c sets cwd.
                 resume_uuid = prior_uuid.strip()
             elif str(prior_meta.get("workspace") or "") == str(workspace):
                 resume_uuid = prior_uuid.strip()
@@ -296,9 +307,14 @@ class TmuxSessionRuntime:
             check=True,
         )
         self.configure_window_size(session_name)
+        prior_initialized = prior_meta.get("session_prompt_version") == SESSION_PROMPT_VERSION
         self.write_metadata(session_name, chat_id, command, workspace)
         if keep_uuid:
             self.store_session_uuid(session_name, keep_uuid)
+            # A resumed conversation already carries the session setup prompt
+            # in its history — don't send it again.
+            if prior_initialized:
+                self.mark_session_initialized(session_name, chat_id, workspace)
         self.ensure_transcript_pipe(session_name)
         self.wait_for_session_ready(session_name)
         if self.agent == "claude":
@@ -309,9 +325,12 @@ class TmuxSessionRuntime:
                     break
                 time.sleep(0.5)
         self.refresh_detected_session_labels(session_name)
-        self.apply_startup_commands(session_name)
+        # A resumed session already ran its startup commands (e.g.
+        # /permissions auto-review) in its restored history — skip them.
+        if not (keep_uuid and prior_initialized):
+            self.apply_startup_commands(session_name)
         self.refresh_cli_session_files(session_name, chat_id)
-        return True
+        return not self.session_initialized(session_name)
 
     def command(
         self,
@@ -325,6 +344,16 @@ class TmuxSessionRuntime:
             args = with_codex_effort_arg(args, effort or self.settings.codex_default_effort)
             args.extend(["-C", str(workspace)])
             command = [self.settings.codex_cmd, *args]
+            return [
+                *self._env_prefix(),
+                *proxy_command_prefix(self.settings.agent_proxy_url, self.settings.no_proxy),
+                *command,
+            ]
+        if self.agent == "codebuddy":
+            args = list(self.settings.codebuddy_session_args)
+            args = with_model_arg(args, model or self.settings.codebuddy_model, "--model")
+            args = with_codebuddy_effort_arg(args, effort or self.settings.codebuddy_default_effort)
+            command = [self.settings.codebuddy_cmd, *args]
             return [
                 *self._env_prefix(),
                 *proxy_command_prefix(self.settings.agent_proxy_url, self.settings.no_proxy),
@@ -347,7 +376,7 @@ class TmuxSessionRuntime:
         Returns (launch, keep_uuid). For codex fresh, keep_uuid is None (the id
         is captured later from the rollout); otherwise it is the id to store.
         """
-        if self.agent == "claude":
+        if self.agent in {"claude", "codebuddy"}:
             if resume_uuid:
                 return ([*command, "--resume", resume_uuid], resume_uuid)
             new_uuid = str(uuid.uuid4())
@@ -511,22 +540,41 @@ class TmuxSessionRuntime:
 
     def detect_model(self, chat_id: str) -> str | None:
         session_name = self.session_name(chat_id)
+        metadata = self.read_metadata(session_name)
+        codebuddy_current_model = None
+        if self.agent == "codebuddy" and self.session_exists(session_name):
+            codebuddy_current_model = metadata_string(metadata, "model") or command_arg_value(
+                metadata.get("command"), "--model"
+            )
         # Prefer JSONL transcript — reliable, no tmux screen scraping needed.
         transcript = self._read_recent_transcript(session_name, chat_id)
         if transcript:
             from .transcripts import claude_model_from_lines, codex_model_from_lines
-            model = (codex_model_from_lines if self.agent == "codex" else claude_model_from_lines)(transcript)
+            if self.agent == "codex":
+                model = codex_model_from_lines(transcript)
+            elif self.agent == "codebuddy":
+                model = codebuddy_model_from_lines(transcript)
+                if model and not codebuddy_model_is_stale(transcript, metadata.get("created_at")):
+                    return model
+                if codebuddy_current_model:
+                    return codebuddy_current_model
+            else:
+                model = claude_model_from_lines(transcript)
             if model:
                 return model
+        if self.agent == "codebuddy":
+            return codebuddy_current_model or metadata_string(metadata, "model") or command_arg_value(
+                metadata.get("command"), "--model"
+            )
         if not self.session_exists(session_name):
-            return metadata_string(self.read_metadata(session_name), "detected_model", "model")
+            return metadata_string(metadata, "detected_model", "model")
         try:
             detected = parse_session_model(self.capture_with_transcript(session_name), self.agent)
         except subprocess.CalledProcessError:
             detected = None
         if detected:
             return detected
-        return metadata_string(self.read_metadata(session_name), "detected_model", "model")
+        return metadata_string(metadata, "detected_model", "model")
 
     def _read_recent_transcript(self, session_name: str, chat_id: str, max_lines: int = 50) -> list[dict] | None:
         """Read the last N lines from the session's transcript JSONL."""
@@ -554,22 +602,34 @@ class TmuxSessionRuntime:
 
     def detect_effort(self, chat_id: str) -> str | None:
         session_name = self.session_name(chat_id)
+        metadata = self.read_metadata(session_name)
         # Prefer JSONL transcript — codex records reasoning effort in turn_context.
         transcript = self._read_recent_transcript(session_name, chat_id)
         if transcript:
             from .transcripts import claude_effort_from_lines, codex_effort_from_lines
-            effort = (codex_effort_from_lines if self.agent == "codex" else claude_effort_from_lines)(transcript)
+            if self.agent == "codex":
+                effort = codex_effort_from_lines(transcript)
+            elif self.agent == "codebuddy":
+                effort = codebuddy_effort_from_lines(transcript)
+            else:
+                effort = claude_effort_from_lines(transcript)
             if effort:
                 return effort
+        if self.agent == "codebuddy":
+            current = metadata_string(metadata, "detected_effort", "effort") or command_arg_value(
+                metadata.get("command"), "--effort"
+            )
+            if current:
+                return current
         if not self.session_exists(session_name):
-            return metadata_string(self.read_metadata(session_name), "detected_effort", "effort")
+            return metadata_string(metadata, "detected_effort", "effort")
         try:
             detected = parse_session_effort(self.capture_with_transcript(session_name), self.agent)
         except subprocess.CalledProcessError:
             detected = None
         if detected:
             return detected
-        return metadata_string(self.read_metadata(session_name), "detected_effort", "effort")
+        return metadata_string(metadata, "detected_effort", "effort")
 
     def session_progress(self, chat_id: str) -> str | None:
         session_name = self.session_name(chat_id)
@@ -720,11 +780,43 @@ class TmuxSessionRuntime:
                 temp_path = Path(handle.name)
             try:
                 subprocess.run(["tmux", "send-keys", "-t", session_name, "C-u"], check=True)
+                if self.agent == "codebuddy":
+                    subprocess.run(["tmux", "send-keys", "-t", session_name, "C-a", "C-k"], check=True)
                 subprocess.run(["tmux", "load-buffer", str(temp_path)], check=True)
                 subprocess.run(["tmux", "paste-buffer", "-p", "-t", session_name], check=True)
+                if self.agent == "codex":
+                    # Codex can render large bracketed pastes asynchronously;
+                    # an immediate Enter may race ahead and submit nothing.
+                    time.sleep(CODEX_PASTE_SETTLE_SECONDS)
+                elif self.agent == "claude":
+                    # Claude Code's TUI also needs a moment to process large
+                    # bracketed pastes before Enter — without this, Enter can
+                    # race the paste and submit an empty/partial input.
+                    time.sleep(CLAUDE_PASTE_SETTLE_SECONDS)
+                elif self.agent == "codebuddy":
+                    # CodeBuddy collapses large bracketed pastes into a
+                    # "[Pasted text #N]" attachment asynchronously. Give that
+                    # render step a moment so Enter submits the input instead
+                    # of racing the paste handler.
+                    time.sleep(CODEBUDDY_PASTE_SETTLE_SECONDS)
                 subprocess.run(["tmux", "send-keys", "-t", session_name, "Enter"], check=True)
+                self._ensure_codebuddy_submission(session_name)
             finally:
                 temp_path.unlink(missing_ok=True)
+
+    def _ensure_codebuddy_submission(self, session_name: str) -> None:
+        if self.agent != "codebuddy":
+            return
+        for _ in range(CODEBUDDY_SUBMIT_RETRIES):
+            time.sleep(CODEBUDDY_SUBMIT_RETRY_DELAY_SECONDS)
+            try:
+                screen = self.capture(session_name)
+            except subprocess.CalledProcessError:
+                return
+            if not codebuddy_prompt_has_pending_input(screen):
+                return
+            LOGGER.info("CodeBuddy input still pending in %s after Enter; retrying submit", session_name)
+            subprocess.run(["tmux", "send-keys", "-t", session_name, "Enter"], check=True)
 
     def dismiss_claude_feedback_prompt_if_visible(
         self,
@@ -823,15 +915,18 @@ class TmuxSessionRuntime:
             return False
 
     def apply_startup_commands(self, session_name: str) -> None:
-        if self.agent != "codex":
+        if self.agent == "codex":
+            commands = getattr(self.settings, "codex_startup_commands", ())
+        elif self.agent == "codebuddy":
+            commands = getattr(self.settings, "codebuddy_startup_commands", ())
+        else:
             return
-        commands = getattr(self.settings, "codex_startup_commands", ())
         for command in commands:
             if not command.strip():
                 continue
             self.paste_and_submit(session_name, command)
             time.sleep(1)
-            if command.strip() == "/permissions":
+            if self.agent == "codex" and command.strip() == "/permissions":
                 self._select_codex_menu_option(session_name, "2")
 
     def _select_codex_menu_option(self, session_name: str, option: str) -> None:
@@ -938,7 +1033,7 @@ class TmuxSessionRuntime:
                 time.sleep(0.5)
                 continue
             if progress_callback and time.time() - last_progress >= max(1.0, progress_interval):
-                display = "Codex" if self.agent == "codex" else "Claude"
+                display = agent_display_name(self.agent)
                 detail = summarize_session_progress(screen, self.agent)
                 progress_callback(detail or f"Waiting for {display} reply.")
                 last_progress = time.time()
@@ -1005,13 +1100,16 @@ class TmuxSessionRuntime:
         deadline = time.time() + max(1.0, self.settings.session_startup_wait)
         last_capture = ""
         resume_dismissed = False
-        while time.time() < deadline:
+        extended_deadline = deadline + 30.0
+        while time.time() < extended_deadline:
             try:
                 last_capture = self.capture(session_name)
             except subprocess.CalledProcessError:
                 time.sleep(0.5)
                 continue
-            if session_ready_for_input(last_capture, self.agent):
+            if session_ready_for_current_input(last_capture, self.agent):
+                return
+            if time.time() >= deadline and last_capture and not session_tail_busy(last_capture):
                 return
             # Claude --resume on large sessions shows a dialog asking whether to
             # resume from summary (1) or full (2). Auto-select "2. Resume full
@@ -1043,12 +1141,11 @@ class TmuxSessionRuntime:
             context_block = f"""{session_context or self.default_session_context()}
 
 """
-        return f"""{context_block}Message:
-{prompt}
+        return f"""{context_block}{prompt}
 """
 
     def default_session_context(self) -> str:
-        display_name = "Codex" if self.agent == "codex" else "Claude Code"
+        display_name = agent_display_name(self.agent)
         return f"""Session setup for {display_name}.
 
 This is a long-lived Feishu research-room session for exactly one group.
@@ -1156,7 +1253,7 @@ Do not edit local files or run long experiments unless a human explicitly asks."
             captured = self.capture_with_transcript(session_name)
         except subprocess.CalledProcessError:
             return
-        detected_model = parse_session_model(captured, self.agent)
+        detected_model = None if self.agent == "codebuddy" else parse_session_model(captured, self.agent)
         detected_effort = parse_session_effort(captured, self.agent)
         if not detected_model and not detected_effort:
             return
@@ -1191,6 +1288,7 @@ Do not edit local files or run long experiments unless a human explicitly asks."
             created_at,
             self.codex_state_dir(),
             self.claude_state_dir(),
+            self.codebuddy_state_dir(),
         )
         paths = sorted(existing | {str(path) for path in discovered})
         if not paths:
@@ -1217,6 +1315,7 @@ Do not edit local files or run long experiments unless a human explicitly asks."
                 created_at,
                 self.codex_state_dir(),
                 self.claude_state_dir(),
+                self.codebuddy_state_dir(),
             )
         )
         session_ids = session_ids_for_files(paths, self.agent)
@@ -1225,7 +1324,13 @@ Do not edit local files or run long experiments unless a human explicitly asks."
             paths.update(discover_claude_subagent_paths(paths))
         deleted: list[Path] = []
         for path in sorted(paths):
-            if not safe_cli_session_path(path, self.agent, self.codex_state_dir(), self.claude_state_dir()):
+            if not safe_cli_session_path(
+                path,
+                self.agent,
+                self.codex_state_dir(),
+                self.claude_state_dir(),
+                self.codebuddy_state_dir(),
+            ):
                 continue
             if not path.exists():
                 continue
@@ -1238,9 +1343,14 @@ Do not edit local files or run long experiments unless a human explicitly asks."
             prune_codex_history(self.codex_state_dir(), chat_id, session_ids)
         if self.agent == "claude":
             prune_jsonl_lines(self.claude_state_dir() / "history.jsonl", chat_id, session_ids)
+        if self.agent == "codebuddy":
+            prune_jsonl_lines(self.codebuddy_state_dir() / "history.jsonl", chat_id, session_ids)
         return deleted
 
     def codex_state_dir(self) -> Path:
+        env_home = self.extra_env.get("CODEX_HOME") if self.extra_env else None
+        if isinstance(env_home, str) and env_home.strip():
+            return Path(env_home).expanduser().resolve()
         value = getattr(self.settings, "codex_state_dir", None)
         if isinstance(value, Path):
             return value.expanduser().resolve()
@@ -1252,6 +1362,12 @@ Do not edit local files or run long experiments unless a human explicitly asks."
             return value.expanduser().resolve()
         return Path("~/.claude").expanduser().resolve()
 
+    def codebuddy_state_dir(self) -> Path:
+        value = getattr(self.settings, "codebuddy_state_dir", None)
+        if isinstance(value, Path):
+            return value.expanduser().resolve()
+        return Path("~/.codebuddy").expanduser().resolve()
+
     # ---- native transcript (JSONL) reply path ----
 
     def claude_projects_root(self) -> Path:
@@ -1260,20 +1376,22 @@ Do not edit local files or run long experiments unless a human explicitly asks."
     def codex_sessions_root(self) -> Path:
         return self.codex_state_dir() / "sessions"
 
+    def codebuddy_projects_root(self) -> Path:
+        return self.codebuddy_state_dir() / "projects"
+
     def resolve_transcript_path(
         self, session_name: str, chat_id: str, workspace: Path
     ) -> Path | None:
         meta = self.read_metadata(session_name)
         pinned = meta.get("transcript_path")
-        if isinstance(pinned, str) and pinned and Path(pinned).exists():
-            return Path(pinned)
+        if isinstance(pinned, str) and pinned:
+            pinned_path = Path(pinned)
+            if pinned_path.exists() and pinned_path.suffix == ".jsonl":
+                return pinned_path
         path: Path | None = None
         if self.agent == "codex":
             created = metadata_float(meta, "created_at") or 0.0
             existing = meta.get("session_uuid")
-            # Prefer id-based lookup: the rollout's session_meta.cwd is frozen at
-            # creation, so cwd matching breaks after a `/workspace` switch or a
-            # cross-machine migration. Matching the known session id is stable.
             if isinstance(existing, str) and existing.strip():
                 path = find_codex_rollout_by_id(
                     self.codex_sessions_root(), existing.strip()
@@ -1282,12 +1400,24 @@ Do not edit local files or run long experiments unless a human explicitly asks."
                 path = find_codex_rollout(
                     self.codex_sessions_root(), workspace, min_mtime=max(0.0, created - 5)
                 )
-            # Capture codex's session id from its rollout so it can be resumed
-            # later (codex picks a fresh id per launch; we don't control it).
             if path is not None and not (isinstance(existing, str) and existing.strip()):
                 sid = rollout_session_id(path)
                 if sid:
                     self.store_session_uuid(session_name, sid)
+        elif self.agent == "codebuddy":
+            sid = meta.get("session_uuid")
+            if isinstance(sid, str) and sid:
+                path = find_codebuddy_session_file(self.codebuddy_projects_root(), sid)
+                if path is None:
+                    path = (
+                        self.codebuddy_projects_root()
+                        / encode_codebuddy_project_dir(workspace)
+                        / f"{sid}.jsonl"
+                    )
+            if path is None or not path.exists():
+                recent = find_codebuddy_recent_session_file(self.codebuddy_projects_root(), workspace)
+                if recent is not None:
+                    path = recent
         else:
             sid = meta.get("session_uuid")
             if isinstance(sid, str) and sid:
@@ -1318,11 +1448,11 @@ Do not edit local files or run long experiments unless a human explicitly asks."
         return (str(path) if path else "", 0)
 
     def parse_transcript_reply(self, lines: list[dict]):
-        return (
-            codex_reply_from_lines(lines)
-            if self.agent == "codex"
-            else claude_reply_from_lines(lines)
-        )
+        if self.agent == "codex":
+            return codex_reply_from_lines(lines)
+        if self.agent == "codebuddy":
+            return codebuddy_reply_from_lines(lines)
+        return claude_reply_from_lines(lines)
 
     def read_jsonl_reply(self, path_str: str, offset: int) -> str | None:
         if not path_str:
@@ -1351,7 +1481,10 @@ Do not edit local files or run long experiments unless a human explicitly asks."
         acc: list[dict] = []
         last_progress = 0.0
         last_action: str | None = None
-        feedback_dismissed = False
+        pushed_messages = 0
+        codebuddy_candidate = None
+        codebuddy_candidate_cursor = cur
+        codebuddy_candidate_seen_at = 0.0
         while time.time() < deadline:
             if path is None or not path.exists():
                 resolved = self.resolve_transcript_path(session_name, chat_id, workspace)
@@ -1359,35 +1492,75 @@ Do not edit local files or run long experiments unless a human explicitly asks."
                     time.sleep(1)
                     continue
                 if str(resolved) != path_str:
-                    cur = 0  # a freshly created session's transcript just appeared
+                    cur = 0
+                    acc.clear()
+                    pushed_messages = 0
                 path = resolved
             new, cur = read_new_jsonl(path, cur)
             if new:
                 acc.extend(new)
                 result = self.parse_transcript_reply(acc)
-                if result is not None:
+                if self.agent == "codebuddy":
+                    if result is None:
+                        codebuddy_candidate = None
+                    else:
+                        codebuddy_candidate = result
+                        codebuddy_candidate_cursor = cur
+                        codebuddy_candidate_seen_at = time.time()
+                elif result is not None:
                     self.pin_transcript(session_name, path)
                     return result.text, result.usage, (str(path), cur)
-            # Update the card when the activity changes OR at least every 10s,
-            # throttled to `progress_interval` minimum between updates.
+            if (
+                self.agent == "codebuddy"
+                and codebuddy_candidate is not None
+                and time.time() - codebuddy_candidate_seen_at >= CODEBUDDY_REPLY_QUIET_SECONDS
+            ):
+                self.pin_transcript(session_name, path)
+                return (
+                    codebuddy_candidate.text,
+                    codebuddy_candidate.usage,
+                    (str(path), codebuddy_candidate_cursor),
+                )
+            # Push every NEW intermediate message immediately (sticky content);
+            # throttle the volatile status line to `progress_interval`.
             if progress_callback:
-                act = codex_activity(acc) if self.agent == "codex" else claude_activity(acc)
+                from .transcripts import activity_status, turn_messages
+                if self.agent == "codex":
+                    act = codex_activity(acc)
+                elif self.agent == "codebuddy":
+                    act = codebuddy_activity(acc)
+                else:
+                    act = claude_activity(acc)
+                msgs = turn_messages(acc, self.agent)
+                new_msgs = msgs[pushed_messages:]
                 elapsed = time.time() - last_progress
                 action_changed = act["action"] != last_action
-                if elapsed >= max(1.0, progress_interval) and (action_changed or elapsed >= 10):
-                    progress_callback(activity_detail(acc, self.agent))
+                if new_msgs:
+                    progress_callback({
+                        "messages": new_msgs,
+                        "status": activity_status(acc, self.agent),
+                    })
+                    pushed_messages = len(msgs)
+                    last_action = act["action"]
+                    last_progress = time.time()
+                elif elapsed >= max(1.0, progress_interval) and (action_changed or elapsed >= 10):
+                    progress_callback({
+                        "messages": [],
+                        "status": activity_status(acc, self.agent),
+                    })
                     last_action = act["action"]
                     last_progress = time.time()
             # Peek at the screen to clear blocking interactive prompts (the
             # feedback survey can appear multiple times or take a moment to
             # dismiss, so keep retrying — not just once).
-            try:
-                screen = self.capture(session_name)
-            except subprocess.CalledProcessError:
-                screen = ""
-            if screen and self.dismiss_claude_feedback_prompt_if_visible(session_name, screen):
-                time.sleep(0.5)
-                continue
+            if self.agent == "claude":
+                try:
+                    screen = self.capture(session_name)
+                except subprocess.CalledProcessError:
+                    screen = ""
+                if screen and self.dismiss_claude_feedback_prompt_if_visible(session_name, screen):
+                    time.sleep(0.5)
+                    continue
             time.sleep(1)
         raise TmuxReplyStillRunning(
             f"{self.agent} session {session_name} did not finish within {timeout}s "
@@ -1461,11 +1634,14 @@ def discover_cli_session_files(
     created_at: float | None,
     codex_state_dir: Path,
     claude_state_dir: Path,
+    codebuddy_state_dir: Path,
 ) -> set[Path]:
     if agent == "codex":
         return discover_codex_session_files(codex_state_dir, chat_id, workspace, created_at)
     if agent == "claude":
         return discover_claude_session_files(claude_state_dir, chat_id, workspace, created_at)
+    if agent == "codebuddy":
+        return discover_codebuddy_session_files(codebuddy_state_dir, chat_id, workspace, created_at)
     return set()
 
 
@@ -1499,6 +1675,20 @@ def discover_claude_session_files(
     }
 
 
+def discover_codebuddy_session_files(
+    state_dir: Path,
+    chat_id: str,
+    workspace: Path | None,
+    created_at: float | None,
+) -> set[Path]:
+    root = state_dir / "projects"
+    return {
+        path.resolve()
+        for path in iter_files(root, "*.jsonl")
+        if codebuddy_file_matches(path, chat_id, workspace, created_at)
+    }
+
+
 def iter_files(root: Path, pattern: str) -> list[Path]:
     if not root.exists():
         return []
@@ -1528,6 +1718,21 @@ def codex_file_matches(
 
 
 def claude_file_matches(
+    path: Path,
+    chat_id: str,
+    workspace: Path | None,
+    created_at: float | None,
+) -> bool:
+    text = read_text_sample(path, max_bytes=4_000_000)
+    if valid_chat_id(chat_id) and chat_id in text:
+        return True
+    if not workspace or not path_matches_workspace(first_jsonl_cwd(text), workspace):
+        return False
+    timestamp = first_jsonl_timestamp(text)
+    return timestamp_close(timestamp, created_at) or timestamp_close(path_mtime(path), created_at)
+
+
+def codebuddy_file_matches(
     path: Path,
     chat_id: str,
     workspace: Path | None,
@@ -1586,6 +1791,11 @@ def first_jsonl_timestamp(text: str) -> float | None:
             parsed = iso_to_epoch(value)
             if parsed is not None:
                 return parsed
+        if isinstance(value, (int, float)):
+            parsed = float(value)
+            if parsed > 1_000_000_000_000:
+                parsed /= 1000.0
+            return parsed
     return None
 
 
@@ -1637,6 +1847,10 @@ def session_ids_for_files(paths: set[Path], agent: str) -> set[str]:
             session_id = claude_session_id(path)
             if session_id:
                 session_ids.add(session_id)
+        elif agent == "codebuddy":
+            session_id = codebuddy_session_id(path)
+            if session_id:
+                session_ids.add(session_id)
     return session_ids
 
 
@@ -1659,6 +1873,21 @@ def claude_session_id(path: Path) -> str | None:
             return None
         value = data.get("sessionId") if isinstance(data, dict) else None
         return value.strip() if isinstance(value, str) and value.strip() else None
+    return None
+
+
+def codebuddy_session_id(path: Path) -> str | None:
+    if path.suffix == ".jsonl":
+        text = read_text_sample(path, max_bytes=64_000)
+        for line in text.splitlines()[:20]:
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            value = data.get("sessionId")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return path.stem if looks_like_uuid(path.stem) else None
     return None
 
 
@@ -1698,6 +1927,7 @@ def safe_cli_session_path(
     agent: str,
     codex_state_dir: Path,
     claude_state_dir: Path,
+    codebuddy_state_dir: Path,
 ) -> bool:
     path = path.expanduser().resolve()
     if agent == "codex":
@@ -1709,6 +1939,10 @@ def safe_cli_session_path(
         if is_relative_to(path, claude_state_dir / "projects"):
             return path.suffix == ".jsonl" or path.is_dir()
         return is_relative_to(path, claude_state_dir / "sessions") and path.suffix == ".json"
+    if agent == "codebuddy":
+        if is_relative_to(path, codebuddy_state_dir / "projects"):
+            return path.suffix == ".jsonl"
+        return is_relative_to(path, codebuddy_state_dir / "sessions") and path.suffix == ".json"
     return False
 
 
@@ -1861,6 +2095,14 @@ def session_ready_for_input(text: str, agent: str) -> bool:
         return "❯" in text or "Try \"" in text or "don't ask on" in text
     if agent == "codex":
         return "›" in text or "context left" in text
+    if agent == "codebuddy":
+        return (
+            "❯" in text
+            or "›" in text
+            or "CodeBuddy" in text
+            or "bypass permissions on" in text
+            or bool(re.search(r"(?m)^\s*>\s*(?:$|.*↵ send\s*$)", text))
+        )
     return bool(text.strip())
 
 
@@ -1872,6 +2114,19 @@ def session_ready_for_current_input(text: str, agent: str) -> bool:
     return session_ready_for_input(tail, agent)
 
 
+def codebuddy_prompt_has_pending_input(text: str) -> bool:
+    lines = [line.rstrip() for line in normalize_terminal_text(text).splitlines() if line.strip()]
+    tail_lines = lines[-12:]
+    tail = "\n".join(tail_lines)
+    if session_tail_busy(tail):
+        return False
+    for line in reversed(tail_lines):
+        match = re.match(r"^\s*>\s*(.*?)\s*↵ send\s*$", line)
+        if match:
+            return bool(match.group(1).strip())
+    return False
+
+
 def claude_feedback_prompt_visible(text: str) -> bool:
     lines = [line for line in normalize_terminal_text(text).splitlines() if line.strip()]
     tail = "\n".join(lines[-14:])
@@ -1881,7 +2136,7 @@ def claude_feedback_prompt_visible(text: str) -> bool:
 def session_tail_busy(text: str) -> bool:
     return bool(
         re.search(
-            r"Compacting conversation|esc to interrupt|\bWorking\b|^\s*(?:\*|✽|✢|✶)\s+",
+            r"Compacting conversation|esc to interrupt|\bWorking\b|model:\s+loading|^\s*(?:\*|✽|✢|✶)\s+",
             text,
             re.MULTILINE,
         )
@@ -1901,7 +2156,7 @@ def session_has_background_work(text: str) -> bool:
 
 
 def parse_session_model(text: str, agent: str) -> str | None:
-    if agent == "codex":
+    if agent in {"codex", "codebuddy"}:
         footer = re.compile(
             r"(?m)^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s+"
             rf"(?:{EFFORT_TOKEN_PATTERN})\s+·\s+/"
@@ -1931,7 +2186,7 @@ def parse_session_effort(text: str, agent: str) -> str | None:
     command_matches = command_result.findall(text)
     if command_matches:
         return command_matches[-1].lower()
-    if agent == "codex":
+    if agent in {"codex", "codebuddy"}:
         footer = re.compile(
             r"(?m)^\s*[A-Za-z0-9][A-Za-z0-9._-]*\s+"
             rf"({EFFORT_TOKEN_PATTERN})\s+·\s+/"
@@ -1959,6 +2214,48 @@ def metadata_string(data: dict[str, object], *keys: str) -> str | None:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def command_arg_value(command: object, flag: str) -> str | None:
+    if not isinstance(command, list):
+        return None
+    parts = [str(part) for part in command]
+    prefix = f"{flag}="
+    for index, part in enumerate(parts):
+        if part.startswith(prefix) and part[len(prefix) :].strip():
+            return part[len(prefix) :].strip()
+        if part == flag and index + 1 < len(parts) and parts[index + 1].strip():
+            return parts[index + 1].strip()
+    return None
+
+
+def codebuddy_model_is_stale(lines: list[dict], created_at: object) -> bool:
+    try:
+        created = float(created_at)
+    except (TypeError, ValueError):
+        return False
+    if created <= 0:
+        return False
+    for item in reversed(lines):
+        provider = item.get("providerData")
+        if not isinstance(provider, dict):
+            continue
+        if not any(
+            isinstance(provider.get(key), str) and provider.get(key, "").strip()
+            for key in ("model", "requestModelId", "requestModelName")
+        ):
+            continue
+        try:
+            timestamp = float(item.get("timestamp"))
+        except (TypeError, ValueError):
+            # This provider line has no usable timestamp — keep scanning older
+            # lines rather than short-circuiting to "not stale", which would
+            # report a genuinely stale model as current.
+            continue
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000.0
+        return timestamp < created
+    return False
 
 
 def summarize_session_progress(text: str, agent: str, limit: int = 260) -> str | None:
@@ -2008,6 +2305,8 @@ def skip_progress_line(line: str, agent: str) -> bool:
     if re.search(r"\b(?:minimal|low|medium|high|xhigh|max)\s+·\s+/", line):
         return True
     if agent == "codex" and line in {"OpenAI Codex", "Working"}:
+        return True
+    if agent == "codebuddy" and line in {"CodeBuddy", "Working"}:
         return True
     return False
 
@@ -2063,3 +2362,28 @@ def has_codex_effort_arg(args: list[str]) -> bool:
         if arg.startswith("model_reasoning_effort="):
             return True
     return False
+
+
+def with_codebuddy_effort_arg(args: list[str], effort: str | None) -> list[str]:
+    if not effort or has_codebuddy_effort_arg(args):
+        return args
+    return [*args, "--effort", effort]
+
+
+def has_codebuddy_effort_arg(args: list[str]) -> bool:
+    for index, arg in enumerate(args):
+        if arg == "--effort":
+            return index + 1 < len(args)
+        if arg.startswith("--effort="):
+            return True
+    return False
+
+
+def agent_display_name(agent: str) -> str:
+    if agent == "codex":
+        return "Codex"
+    if agent == "claude":
+        return "Claude Code"
+    if agent == "codebuddy":
+        return "CodeBuddy"
+    return agent

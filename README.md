@@ -3,8 +3,8 @@
 Local bridge for a Feishu research group:
 
 - Listen to group messages through `lark-cli event consume`.
-- Let two visible Feishu app bots respond as `@Codex` and `@Claude Code`.
-- Route `/codex`, `/claude`, and `/debate` prompts to local Codex and Claude Code.
+- Let visible Feishu app bots respond as `@Codex`, `@Claude Code`, and optionally `@CodeBuddy`.
+- Route `/codex`, `/claude`, `/codebuddy`, and `/debate` prompts to local assistant CLIs.
 - Create Feishu tasks from `/task ...` messages.
 - Send replies back to the same Feishu group.
 
@@ -14,6 +14,7 @@ for each app profile:
 
 - Feishu bot display name: `Codex`; local backend: `codex exec`
 - Feishu bot display name: `Claude Code`; local backend: `claude -p`
+- Optional Feishu bot display name: `CodeBuddy`; local backend: `codebuddy`
 
 ## Setup
 
@@ -23,6 +24,7 @@ for each app profile:
    lark-cli --help
    codex --help
    claude --help
+   codebuddy --help
    ```
 
 2. Configure two `lark-cli` profiles. Each profile should point at a different
@@ -65,10 +67,12 @@ for each app profile:
    cd /apdcephfs_sgfd/share_303735497/yixianliu/arimazhu/paper-lark-agents
    cp .env.codex.example .env.codex
    cp .env.claude.example .env.claude
+   cp .env.codebuddy.example .env.codebuddy
    ```
 
-   Keep `PLA_LARK_PROFILE=codex` in `.env.codex` and
-   `PLA_LARK_PROFILE=claude` in `.env.claude`.
+   Keep `PLA_LARK_PROFILE=codex` in `.env.codex`,
+   `PLA_LARK_PROFILE=claude` in `.env.claude`, and
+   `PLA_LARK_PROFILE=codebuddy` in `.env.codebuddy`.
 
    Network proxy policy is explicit and does not rely on the shell's inherited
    `http_proxy` values:
@@ -120,6 +124,7 @@ Both assistants run as long-lived per-group sessions by default:
 
 - `PLA_CODEX_RUNTIME=session`
 - `PLA_CLAUDE_RUNTIME=session`
+- `PLA_CODEBUDDY_RUNTIME=session`
 
 By default the bridge does not force a model or effort at startup. Codex keeps
 `--no-alt-screen` so tmux can capture the reply markers reliably; Claude starts
@@ -130,10 +135,13 @@ PLA_CODEX_SESSION_ARGS=--no-alt-screen
 PLA_CODEX_STARTUP_COMMANDS=/permissions auto-review
 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1
 PLA_CLAUDE_SESSION_ARGS=--permission-mode auto --teammate-mode in-process
+PLA_CODEBUDDY_SESSION_ARGS=--permission-mode acceptEdits
 PLA_CODEX_MODEL=
 PLA_CODEX_DEFAULT_EFFORT=
 PLA_CLAUDE_MODEL=
 PLA_CLAUDE_DEFAULT_EFFORT=
+PLA_CODEBUDDY_MODEL=
+PLA_CODEBUDDY_DEFAULT_EFFORT=xhigh
 ```
 
 You can set model or effort from Feishu when needed:
@@ -143,6 +151,7 @@ You can set model or effort from Feishu when needed:
 @Claude /effort max
 @Codex /model gpt-5.5
 @Claude /model opus
+@CodeBuddy /effort xhigh
 ```
 
 Targeted slash commands are pasted into the named assistant's tmux session
@@ -219,6 +228,13 @@ new directory.
    python -m paper_lark_agents serve-duo --codex-env .env.codex --claude-env .env.claude
    ```
 
+   Run CodeBuddy as a third bridge process when you have created its Feishu
+   app/profile:
+
+   ```bash
+   python -m paper_lark_agents --env .env.codebuddy serve
+   ```
+
    Or run them as a background daemon:
 
    ```bash
@@ -235,10 +251,13 @@ new directory.
 What should we read first for this paper?
 @Codex What is the main limitation of this paper?
 @Claude Code Please critique the experiment design.
+@CodeBuddy Please implement the repro harness.
 /codex What is the main limitation of this paper?
 /claude Please critique the experiment design.
+/codebuddy Please implement the repro harness.
 @Codex /effort xhigh
 @Claude /effort max
+@CodeBuddy /effort xhigh
 /debate Compare this method with DINO and SAM.
 /task Read the related work | assignee:ou_xxx | due:+2d | desc:focus on missing baselines
 /workspace
@@ -246,14 +265,15 @@ What should we read first for this paper?
 /workspace reset
 /responder
 /responder claude
+/responder codebuddy
 /responder reset
 ```
 
 When `PLA_RESPOND_TO_ALL=true`, both bots otherwise answer every message. Use
 `/responder` to pick who owns ordinary, unaddressed messages in a group:
 
-- `/responder codex` / `/responder claude` — only that bot answers plain
-  messages; the other stays silent unless `@`-mentioned.
+- `/responder codex` / `/responder claude` / `/responder codebuddy` — only that bot answers plain
+  messages; the others stay silent unless `@`-mentioned.
 - `/responder both` — both answer (the default).
 - `/responder` — show the current setting; `/responder reset` falls back to the
   `PLA_DEFAULT_RESPONDER` env default.

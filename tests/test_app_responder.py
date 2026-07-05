@@ -47,6 +47,13 @@ class ResponderGateTests(unittest.TestCase):
             self.assertEqual(bridge.responders.current("oc_a"), "codex")
             self.assertTrue(bridge.responders.has_override("oc_a"))
 
+    def test_command_sets_codebuddy_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self.bridge(Path(tmp))
+            reply = bridge.handle_responder_command("oc_a", "codebuddy")
+            self.assertIn("CodeBuddy", reply)
+            self.assertEqual(bridge.responders.current("oc_a"), "codebuddy")
+
     def test_command_reset_and_invalid(self):
         with tempfile.TemporaryDirectory() as tmp:
             bridge = self.bridge(Path(tmp), PLA_DEFAULT_RESPONDER="claude")
@@ -107,6 +114,91 @@ class ResponderGateTests(unittest.TestCase):
             # Explicit @Claude must still reach Claude even though Codex is default.
             bridge.handle_event(make_event("@Claude critique the baseline"))
             self.assertEqual(len(calls), 1)
+
+    def test_handle_event_runs_middle_mention_regardless(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self.bridge(
+                Path(tmp),
+                PLA_STRICT_ALIAS_ROUTING="true",
+                PLA_BOT_ALIASES="Claude",
+            )
+            bridge.responders.set("oc_a", "codex")
+            calls = []
+            bridge.dispatch = lambda *a, **k: calls.append((a, k)) or ""
+
+            bridge.handle_event(make_event("这个问题 @Claude 看看"))
+
+            self.assertEqual(bridge.responders.current("oc_a"), "claude")
+            self.assertEqual(len(calls), 1)
+
+    def test_handle_event_runs_later_mention_when_first_at_is_other_bot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self.bridge(
+                Path(tmp),
+                PLA_STRICT_ALIAS_ROUTING="true",
+                PLA_BOT_ALIASES="Claude",
+            )
+            bridge.responders.set("oc_a", "codex")
+            calls = []
+            bridge.dispatch = lambda *a, **k: calls.append((a, k)) or ""
+
+            bridge.handle_event(make_event("@Codex @Claude 都看看"))
+
+            self.assertEqual(bridge.responders.current("oc_a"), "claude")
+            self.assertEqual(len(calls), 1)
+
+    def test_human_mention_switches_default_responder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self.bridge(Path(tmp))  # Claude bot
+            bridge.responders.set("oc_a", "codex")
+            calls = []
+            bridge.dispatch = lambda *a, **k: calls.append((a, k)) or ""
+
+            bridge.handle_event(make_event("@Claude critique the baseline"))
+            bridge.handle_event(make_event("继续说一下"))
+
+            self.assertEqual(bridge.responders.current("oc_a"), "claude")
+            self.assertEqual(len(calls), 2)
+
+    def test_last_human_mention_wins_for_default_responder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self.bridge(Path(tmp))  # Claude bot
+            calls = []
+            bridge.dispatch = lambda *a, **k: calls.append((a, k)) or ""
+
+            bridge.handle_event(make_event("@Codex 先看 @Claude 再补一下"))
+
+            self.assertEqual(bridge.responders.current("oc_a"), "claude")
+            self.assertEqual(len(calls), 1)
+
+    def test_human_mention_to_other_agent_makes_this_process_skip_plain_followup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self.bridge(Path(tmp))  # Claude bot
+            calls = []
+            bridge.dispatch = lambda *a, **k: calls.append((a, k)) or ""
+
+            bridge.handle_event(make_event("@Codex 你先看"))
+            bridge.handle_event(make_event("继续说一下"))
+
+            self.assertEqual(bridge.responders.current("oc_a"), "codex")
+            self.assertEqual(calls, [])
+
+    def test_mention_of_undeployed_agent_does_not_hijack_responder(self):
+        # @CodeBuddy when codebuddy is NOT in the deployed roster must not point
+        # the shared responder at a phantom — that would silence every real bot.
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self.bridge(Path(tmp))  # deployed_agents defaults to codex,claude
+            bridge.dispatch = lambda *a, **k: ""
+            bridge.handle_event(make_event("@CodeBuddy 你看下"))
+            # Responder unchanged (still the default), so codex/claude keep answering.
+            self.assertFalse(bridge.responders.has_override("oc_a"))
+
+    def test_mention_of_deployed_codebuddy_switches_responder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = self.bridge(Path(tmp), PLA_DEPLOYED_AGENTS="codex,claude,codebuddy")
+            bridge.dispatch = lambda *a, **k: ""
+            bridge.handle_event(make_event("@CodeBuddy 你看下"))
+            self.assertEqual(bridge.responders.current("oc_a"), "codebuddy")
 
 
 if __name__ == "__main__":
